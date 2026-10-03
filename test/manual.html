@@ -320,10 +320,11 @@ setTimeout(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
   eq(restartItem.textContent, '正在重启…', 'B2: 200 之后显示「正在重启…」')
   eq(shortcutCloseLog.length, 1, 'B2: 拿到 200 就先请外壳的快捷键服务关窗（官方那条命令）')
-  eq(closeLog.length, 0, 'B2: 有快捷键服务时不退回 window.close')
+  eq(closeLog.length, 1, 'B2: 紧接着也补一次 window.close()（revision 对不上时只有这条管用）')
   await new Promise((resolve) => setTimeout(resolve, 4200))
   eq(restartItem.textContent, '重启应用', 'B2: 提示几秒后自己复原')
   eq(shortcutCloseLog.length, 2, 'B2: 1.2 秒还没掉线就再请一次关窗')
+  eq(closeLog.length, 2, 'B2: 补关那次同样两条路都走')
   eq(fetchLog.length, 2, 'B2: 关窗没人理时，2.6 秒后补一次兜底请求')
   eq(JSON.parse(fetchLog[1].options.body).mode, 'force', 'B2: 兜底那次明确要宿主自己退')
 

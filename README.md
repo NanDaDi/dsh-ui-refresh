@@ -43,7 +43,7 @@
 
 **「重启应用」怎么做的**
 
-确认之后客户端先请外壳**自己把窗口关掉**（走客户端快捷键服务里那条官方「关闭窗口」，拿不到服务就退回标准 `window.close()`）—— 关掉最后一扇窗，外壳自己走 `app.quit()`，那才是"正常退出"；宿主进程在这中间被外壳正常停掉，不会弹「应用无法启动或已意外停止」。关窗前客户端往插件自己注册的本地路由发一个 `POST /dsh-ui-refresh/api/v1/restart`（body `{"mode":"graceful"}`），真正的动作在宿主半边（跑在 Electron 主进程里）：
+确认之后客户端往插件自己注册的本地路由发一个 `POST /dsh-ui-refresh/api/v1/restart`（body `{"mode":"graceful"}`），真正的动作在宿主半边（跑在 Electron 主进程里）；同时它开始请外壳**自己把窗口关掉** —— 这是页面唯一碰得到的"正常退出"入口：关掉最后一扇窗，外壳自己走 `app.quit()`，宿主进程被外壳正常停掉，不会弹「应用无法启动或已意外停止」。关窗**两条路都走**：先调客户端快捷键服务里那条官方「关闭窗口」（`ctx.shortcuts.closeWindow()`），紧接着无条件补一次标准 `window.close()` —— 官方那条只在用户改过快捷键、主进程手里有 revision 时才真正执行，从没改过的机器上它会被静默忽略（0.3.1 就是栽在这：外壳进程等满 60 秒都没退）。宿主半边（跑在 Electron 主进程里）按计划做这几件事：
 
 1. 把当前进程的**命令行、工作目录、可执行文件路径、自己的 pid 和外壳的 pid**写成一份计划文件（`~/.dsh/ui-refresh/restart-plan.json`，**不写任何环境变量或凭据**）；
 2. 用一个**分离的助手进程**执行这份计划 —— 同一个 Electron 二进制以 `ELECTRON_RUN_AS_NODE=1` 当 node 跑 `lib/restart-helper.js`，所以它不随应用一起死；
@@ -51,7 +51,7 @@
 4. 助手轮询**外壳进程真的消失**（有单实例锁，新进程先起会自己 `quit()`；优雅方式最多等 60 秒，用户可能还要在「确认退出」框上点一下），然后用同一套参数把应用起回来；
 5. 起来后睡 2.5 秒探一眼：新进程如果立刻死了（参数被改坏之类），就用**无参数、工作目录 = exe 所在目录**的兜底方式再起一次 —— 这恰好等同于双击桌面上的「DeepSeek Harness」图标。
 
-关窗这条路走不通时还有兜底：1.2 秒后再请一次关窗，2.6 秒页面居然还活着，就退回 `{"mode":"force"}` 让宿主 `process.exit(0)`（v0.3.0 的老办法）。它一定能重启，代价是外壳会把宿主这种退出判成意外停止、弹一次「应用无法启动或已意外停止」的恢复框 —— 所以只当最后手段。
+关窗这条路走不通时还有兜底，而且**不会被"已经在重启了"卡住**：再点一次按钮只当同一次（宿主回 200 幂等、不重复拉助手），1.2 秒后两条路再关一次窗，2.6 秒页面居然还活着，就退回 `{"mode":"force"}` 让宿主 `process.exit(0)`（v0.3.0 的老办法；这条路**永远放行**）。它一定能重启，代价是外壳会把宿主这种退出判成意外停止、弹一次「应用无法启动或已意外停止」的恢复框 —— 所以只当最后手段。宿主那边的"正在重启"标记挂满 90 秒会自动放开，用户随时可以再点一次。
 
 所以最坏情况也不会把应用弄丢：桌面图标 / 开始菜单随时能手动开回来。整个过程写进 `~/.dsh/ui-refresh/restart.log`，起不来的时候先看它。
 
@@ -99,13 +99,13 @@ github:NanDaDi/dsh-ui-refresh
 node test/selftest.mjs
 ```
 
-自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` / `fetch` / `window.close` 替身），覆盖 **411 条断言**：标题栏挂载与样式、下拉开合与每一项的行为（含「重启应用」的两段式确认、只发一次 `POST`、请求体声明 `mode: graceful`、拿不到快捷键服务时退回 `window.close()`、1.2 秒补关窗、2.6 秒退出兜底、提示自己过期、宿主拒绝时显示原因）、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景；另外几节不靠 DOM —— 重启计划的纯函数（路径常量、argv 切分、计划校验、`mode` / `shellPid` / 等待目标 / 超时、同源判据）、宿主半边的路由（405 / 403 / 501 / 409 / 200、读 body 里的 `mode`、优雅方式**不排自杀延时**、spawn 参数、兜底方式才在响应 `finish` 之后退出）、分离助手（优雅方式等外壳进程、兜底方式等宿主、外壳没退就绝不起新进程、先走双击图标再原样重放、立刻死则换一条、计划坏掉就不起进程）；最后是包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
+自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` / `fetch` / `window.close` 替身），覆盖 **426 条断言**：标题栏挂载与样式、下拉开合与每一项的行为（含「重启应用」的两段式确认、只发一次 `POST`、请求体声明 `mode: graceful`、关窗两条路都走、1.2 秒补关窗、2.6 秒退出兜底、提示自己过期、宿主拒绝时显示原因）、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景；另外几节不靠 DOM —— 重启计划的纯函数（路径常量、argv 切分、计划校验、`mode` / `shellPid` / 等待目标 / 超时、同源判据）、宿主半边的路由（405 / 403 / 501 / 200、读 body 里的 `mode`、重复的优雅请求幂等 200、force 永远放行、挂起超时自愈、优雅方式**不排自杀延时**、spawn 参数、兜底方式才在响应 `finish` 之后退出）、分离助手（优雅方式等外壳进程、兜底方式等宿主、外壳没退就绝不起新进程、先走双击图标再原样重放、立刻死则换一条、计划坏掉就不起进程）；最后是包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
 
 `npm test` 与上面的命令等价；`npm run check` 会先做 `node --check` 再跑自检。
 
 ### 真浏览器对照测试
 
-`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **96 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」时自己的面板收起而原生菜单照弹）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、3 秒找不到标题栏时退回胶囊，以及用**假 `fetch`** 记下「重启应用」真正发出的请求（点第一下不动、点第二下恰好一次 `POST /dsh-ui-refresh/api/v1/restart`、`same-origin`、body 是 `{"mode":"graceful"}`、先走快捷键服务关窗、没有服务时退回 `window.close()`、关不掉时 2.6 秒补一次 `{"mode":"force"}`、提示过期、宿主拒绝时显示原因）。
+`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **97 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」时自己的面板收起而原生菜单照弹）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、3 秒找不到标题栏时退回胶囊，以及用**假 `fetch`** 记下「重启应用」真正发出的请求（点第一下不动、点第二下恰好一次 `POST /dsh-ui-refresh/api/v1/restart`、`same-origin`、body 是 `{"mode":"graceful"}`、先走快捷键服务关窗、紧接着也补一次 `window.close()`、关不掉时 2.6 秒补一次 `{"mode":"force"}`、提示过期、宿主拒绝时显示原因）。
 
 用任意 Chromium 打开这个文件即可，结果在页面顶部；命令行版（无头）：
 
