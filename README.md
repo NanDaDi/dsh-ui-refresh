@@ -38,7 +38,7 @@
   - **刷新界面** = 重新加载当前窗口（等于普通浏览器里按 F5）。
   - **清空缓存并刷新** = 先删掉 Cache Storage 里所有缓存、注销 Service Worker，再重新加载。界面看着像旧的时候用它。
   - **重启应用** = 关掉当前应用、再自己开回来（下面单独说）。它要点**两下**：第一下变成「再次点击确认重启」，3 秒内再点一下才真的动手 —— 免得手滑把窗口关掉。确认后窗口会自己关掉再打开；若当时有任务在跑，外壳会弹一次「确认退出」，点退出即可。
-- 收起方式：点面板外面、点「应用」或「编辑」、按 `Escape` 或 `Tab`。上下方向键在三项之间走焦点，回车执行。
+- 收起方式：点面板和「刷新」按钮**以外的任何位置**（页面里、标题栏空白处、标题栏里别的按钮，鼠标**按下**就收）、点到别的窗口让本窗口失焦、按 `Escape` 或 `Tab`。上下方向键在三项之间走焦点，回车执行。
 - 面板跟着按钮走：贴着按钮左下角弹出，出屏幕就自动右移或翻到按钮上方。
 
 **「重启应用」怎么做的**
@@ -99,13 +99,13 @@ github:NanDaDi/dsh-ui-refresh
 node test/selftest.mjs
 ```
 
-自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` / `fetch` / `window.close` 替身），覆盖 **426 条断言**：标题栏挂载与样式、下拉开合与每一项的行为（含「重启应用」的两段式确认、只发一次 `POST`、请求体声明 `mode: graceful`、关窗两条路都走、1.2 秒补关窗、2.6 秒退出兜底、提示自己过期、宿主拒绝时显示原因）、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景；另外几节不靠 DOM —— 重启计划的纯函数（路径常量、argv 切分、计划校验、`mode` / `shellPid` / 等待目标 / 超时、同源判据）、宿主半边的路由（405 / 403 / 501 / 200、读 body 里的 `mode`、重复的优雅请求幂等 200、force 永远放行、挂起超时自愈、优雅方式**不排自杀延时**、spawn 参数、兜底方式才在响应 `finish` 之后退出）、分离助手（优雅方式等外壳进程、兜底方式等宿主、外壳没退就绝不起新进程、先走双击图标再原样重放、立刻死则换一条、计划坏掉就不起进程）；最后是包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
+自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` / `fetch` / `window.close` 替身），覆盖 **436 条断言**：标题栏挂载与样式、下拉开合与每一项的行为（含「重启应用」的两段式确认、只发一次 `POST`、请求体声明 `mode: graceful`、关窗两条路都走、1.2 秒补关窗、2.6 秒退出兜底、提示自己过期、宿主拒绝时显示原因）、Escape / 点外 / **点标题栏里别处 / 点自己的按钮不抢跑 / 窗口失焦** / 点内 / 方向键 / `Tab`、**"点外面"监听的捕获阶段注册与收起时撤销**、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景；另外几节不靠 DOM —— 重启计划的纯函数（路径常量、argv 切分、计划校验、`mode` / `shellPid` / 等待目标 / 超时、同源判据）、宿主半边的路由（405 / 403 / 501 / 200、读 body 里的 `mode`、重复的优雅请求幂等 200、force 永远放行、挂起超时自愈、优雅方式**不排自杀延时**、spawn 参数、兜底方式才在响应 `finish` 之后退出）、分离助手（优雅方式等外壳进程、兜底方式等宿主、外壳没退就绝不起新进程、先走双击图标再原样重放、立刻死则换一条、计划坏掉就不起进程）；最后是包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
 
 `npm test` 与上面的命令等价；`npm run check` 会先做 `node --check` 再跑自检。
 
 ### 真浏览器对照测试
 
-`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **97 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」时自己的面板收起而原生菜单照弹）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、3 秒找不到标题栏时退回胶囊，以及用**假 `fetch`** 记下「重启应用」真正发出的请求（点第一下不动、点第二下恰好一次 `POST /dsh-ui-refresh/api/v1/restart`、`same-origin`、body 是 `{"mode":"graceful"}`、先走快捷键服务关窗、紧接着也补一次 `window.close()`、关不掉时 2.6 秒补一次 `{"mode":"force"}`、提示过期、宿主拒绝时显示原因）。
+`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **105 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」的**按下**就收起自己的面板而原生菜单照弹、点菜单条空白 / 标题栏宿主 / 页面里一个**故意 `stopPropagation` 的元素**都收得掉、窗口失焦也收）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、3 秒找不到标题栏时退回胶囊，以及用**假 `fetch`** 记下「重启应用」真正发出的请求（点第一下不动、点第二下恰好一次 `POST /dsh-ui-refresh/api/v1/restart`、`same-origin`、body 是 `{"mode":"graceful"}`、先走快捷键服务关窗、紧接着也补一次 `window.close()`、关不掉时 2.6 秒补一次 `{"mode":"force"}`、提示过期、宿主拒绝时显示原因）。
 
 用任意 Chromium 打开这个文件即可，结果在页面顶部；命令行版（无头）：
 

@@ -138,6 +138,9 @@ function makeEnv() {
   const store = new Map()
   const docListeners = new Map()
   const winListeners = new Map()
+  // 记下哪些监听器是以捕获阶段（第三参数 true）注册的：面板的"点外面收起"必须挂在捕获上
+  const docCaptures = new Set()
+  const winCaptures = new Set()
 
   // 假定时器
   const timers = { now: 0, nextId: 1, queue: new Map() }
@@ -187,6 +190,7 @@ function makeEnv() {
       attrs: {},
       style: {},
       listeners: new Map(),
+      _captures: new Set(),
       children: [],
       parentNode: null,
       shadowRoot: null,
@@ -225,20 +229,27 @@ function makeEnv() {
         if (child.parentNode === this) child.parentNode = null
         return child
       },
-      addEventListener(type, fn) {
+      addEventListener(type, fn, options) {
         if (typeof fn !== 'function') return
         if (!this.listeners.has(type)) this.listeners.set(type, [])
         this.listeners.get(type).push(fn)
+        if (options === true || (options && options.capture)) this._captures.add(fn)
       },
       removeEventListener(type, fn) {
         const list = this.listeners.get(type)
         if (!list) return
         const i = list.indexOf(fn)
         if (i >= 0) list.splice(i, 1)
+        this._captures.delete(fn)
       },
       countListeners(type) {
         const list = this.listeners.get(type)
         return list ? list.length : 0
+      },
+      /** 以捕获阶段注册的监听器条数。 */
+      captureListeners(type) {
+        const list = this.listeners.get(type) || []
+        return list.filter((fn) => this._captures.has(fn)).length
       },
       dispatch(type, extra) {
         const event = Object.assign(
@@ -256,7 +267,8 @@ function makeEnv() {
               let guardCount = 0
               while (node && guardCount++ < 64) {
                 path.push(node)
-                node = node.parentNode
+                // 真实浏览器里 shadow DOM 的事件会穿透到 host（composed），这里照做
+                node = node.parentNode || node.host || null
               }
               return path
             },
@@ -269,7 +281,8 @@ function makeEnv() {
         while (node && guardCount++ < 64) {
           fire(node.listeners, type, event)
           if (node === doc) break
-          node = node.parentNode
+          // shadow root 的 parentNode 是 null，真实浏览器靠 composed 穿透到 host
+          node = node.parentNode || node.host || null
         }
         return event
       },
@@ -327,20 +340,26 @@ function makeEnv() {
     activeElement: null,
     listeners: docListeners,
     createElement: (tag) => makeElement(tag),
-    addEventListener(type, fn) {
+    addEventListener(type, fn, options) {
       if (typeof fn !== 'function') return
       if (!docListeners.has(type)) docListeners.set(type, [])
       docListeners.get(type).push(fn)
+      if (options === true || (options && options.capture)) docCaptures.add(fn)
     },
     removeEventListener(type, fn) {
       const list = docListeners.get(type)
       if (!list) return
       const i = list.indexOf(fn)
       if (i >= 0) list.splice(i, 1)
+      docCaptures.delete(fn)
     },
     countListeners(type) {
       const list = docListeners.get(type)
       return list ? list.length : 0
+    },
+    captureListeners(type) {
+      const list = docListeners.get(type) || []
+      return list.filter((fn) => docCaptures.has(fn)).length
     },
     fire(type, extra) {
       const event = Object.assign({ type, target: doc, preventDefault() {}, stopPropagation() {} }, extra || {})
@@ -438,10 +457,11 @@ function makeEnv() {
         },
       },
     },
-    addEventListener(type, fn) {
+    addEventListener(type, fn, options) {
       if (typeof fn !== 'function') return
       if (!winListeners.has(type)) winListeners.set(type, [])
       winListeners.get(type).push(fn)
+      if (options === true || (options && options.capture)) winCaptures.add(fn)
     },
     /** 优雅重启靠"关掉窗口"让外壳自己退出，所以这里要能数到它被调了几次。 */
     close() {
@@ -452,10 +472,15 @@ function makeEnv() {
       if (!list) return
       const i = list.indexOf(fn)
       if (i >= 0) list.splice(i, 1)
+      winCaptures.delete(fn)
     },
     countListeners(type) {
       const list = winListeners.get(type)
       return list ? list.length : 0
+    },
+    captureListeners(type) {
+      const list = winListeners.get(type) || []
+      return list.filter((fn) => winCaptures.has(fn)).length
     },
     fire(type, extra) {
       const event = Object.assign({ type, target: win, preventDefault() {}, stopPropagation() {} }, extra || {})
@@ -773,6 +798,30 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   guard('B inside', () => a.panelItems()[0].dispatch('pointerdown', {}))
   ok(!!a.panel(), 'B: 面板内部按下不收起')
 
+  // 标题栏里的"别处"也要收：0.3.3 之前整条 shadow root / host 都被豁免，
+  // 于是只有点「刷新」按钮自己才收得掉。
+  guard('B close again', () => btn.dispatch('click', {}))
+  ok(!a.panel(), 'B: 点「刷新」按钮收起（开合走它自己的 click）')
+  guard('B open bar', () => btn.dispatch('click', {}))
+  guard('B bar down', () => bar.appButton.dispatch('pointerdown', {}))
+  ok(!a.panel(), 'B: 点标题栏里「应用」按钮的按下就收起（不必等它的 click）')
+
+  guard('B open host', () => btn.dispatch('click', {}))
+  guard('B host down', () => bar.host.dispatch('pointerdown', {}))
+  ok(!a.panel(), 'B: 点菜单条容器本身的按下也收起')
+
+  guard('B open btn', () => btn.dispatch('click', {}))
+  eq(a.document.captureListeners('pointerdown'), 1, 'B: document 的"点外面"监听挂在捕获阶段')
+  eq(a.window.captureListeners('pointerdown'), 1, 'B: window 的"点外面"监听挂在捕获阶段')
+  guard('B btn down', () => btn.dispatch('pointerdown', {}))
+  ok(!!a.panel(), 'B: 点「刷新」按钮自身的按下不收（开合交给它的 click）')
+  guard('B blur', () => a.window.fire('blur', {}))
+  ok(!a.panel(), 'B: 窗口失焦（点到别的窗口 / 托盘）收起')
+  eq(a.window.countListeners('pointerdown'), 0, 'B: 收起后 window 的"点外面"监听也撤了')
+  eq(a.window.countListeners('blur'), 0, 'B: 收起后不再跟失焦')
+
+  guard('B open before app', () => btn.dispatch('click', {}))
+  ok(!!a.panel(), 'B: 点「应用」之前面板是开着的')
   guard('B app click', () => bar.appButton.dispatch('click', {}))
   ok(!a.panel(), 'B: 点「应用」收起我们的面板')
 

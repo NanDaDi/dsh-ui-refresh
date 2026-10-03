@@ -199,7 +199,7 @@ near(boxRect.left, rectBefore.left, 2, 'B: 面板左边贴着按钮左边')
 near(boxRect.top, rectBefore.bottom + 4, 2, 'B: 面板顶边在按钮下方 4px')
 eq(box && getComputedStyle(box).position, 'fixed', 'B: 面板是 fixed 定位')
 
-// 点外面关掉（冒泡阶段的 pointerdown）
+// 点外面关掉（window / document 捕获阶段的 pointerdown）
 pointerdownOn(document.body)
 eq(panel(), null, 'B: 点面板外面关掉')
 eq(ourBtn().getAttribute('aria-expanded'), 'false', 'B: 关掉后 aria-expanded=false')
@@ -226,9 +226,41 @@ pointerdownOn(items()[0])
 ok(!!panel(), 'B: 面板内部按下不会自关')
 // 点「应用」：我们的面板收起，原生菜单照弹
 pointerdownOn(shell.appButton)
+eq(panel(), null, 'B: 点「应用」的按下就收起自己的面板（不必等它的 click）')
 shell.appButton.click()
-eq(panel(), null, 'B: 点「应用」时自己的面板收起')
 eq(window.__nativeMenuOpened, 'application', 'B: 「应用」的原生菜单照常弹（我们没拦它）')
+
+// ── B0.3.3：点标题栏里别处也要收（以前只豁免整条 shadow root，只有点「刷新」才收得掉）──
+ourBtn().click()
+ok(!!panel(), 'B: 又打开（准备点标题栏别处）')
+shell.bar.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, composed: true, cancelable: true }))
+eq(panel(), null, 'B: 点菜单条空白处的按下就收起')
+
+ourBtn().click()
+pointerdownOn(shell.host)
+eq(panel(), null, 'B: 点整个标题栏宿主的按下也收起')
+
+// 点自己的按钮：pointerdown 不该抢先收掉（否则随后的 click 会又开一次）
+ourBtn().click()
+pointerdownOn(ourBtn())
+ok(!!panel(), 'B: 点「刷新」按钮自身的按下不收（开合交给它的 click）')
+ourBtn().click()
+eq(panel(), null, 'B: 再点一下按钮才收起')
+
+// 页面里有人对 pointerdown 调 stopPropagation 也拦不住（我们挂在捕获阶段）
+ourBtn().click()
+const blocker = document.createElement('div')
+document.body.appendChild(blocker)
+blocker.addEventListener('pointerdown', (event) => { event.stopPropagation() })
+pointerdownOn(blocker)
+eq(panel(), null, 'B: 页面里 stopPropagation 拦不住收起（捕获阶段生效）')
+if (blocker.parentNode) blocker.parentNode.removeChild(blocker)
+
+// 点到别的窗口（失焦）也收起来
+ourBtn().click()
+ok(!!panel(), 'B: 再打开（准备失焦）')
+window.dispatchEvent(new Event('blur'))
+eq(panel(), null, 'B: 窗口失焦收起')
 
 // 方向键 / Tab
 ourBtn().click()
