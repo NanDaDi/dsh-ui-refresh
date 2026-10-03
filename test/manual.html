@@ -281,7 +281,14 @@ setTimeout(async () => {
   // ── B2 「重启应用」：真 DOM / 真事件路径下的两段式确认 ──────────────────
   const shell3 = installShellMenubar()
   document.body.append(shell3.host)
-  const ctx3 = { handlers: [], on(kind, fn) { this.handlers.push(fn) }, dispose() { this.handlers.slice().forEach((fn) => fn()) } }
+  const shortcutCloseLog = []
+  const shortcuts3 = { closeWindow() { shortcutCloseLog.push(1); return Promise.resolve() } }
+  const ctx3 = {
+    handlers: [],
+    on(kind, fn) { this.handlers.push(fn) },
+    dispose() { this.handlers.slice().forEach((fn) => fn()) },
+    inject(deps, run) { run({ shortcuts: shortcuts3 }) },
+  }
   let apply3Error = null
   try { mod.apply(ctx3) } catch (error) { apply3Error = error }
   ok(apply3Error === null, 'B2: 标题栏回来时 apply 不抛')
@@ -295,6 +302,8 @@ setTimeout(async () => {
   eq(three[2] && three[2].textContent, '重启应用', 'B2: 第三项是「重启应用」')
   const restartItem = three[2]
   ok(!!restartItem, 'B2: 重启项找得到')
+  const closeLog = []
+  window.close = () => { closeLog.push(1) }
 
   restartItem.click()
   eq(fetchLog.length, 0, 'B2: 点第一下不发请求')
@@ -306,23 +315,56 @@ setTimeout(async () => {
   eq(fetchLog[0].url, '/dsh-ui-refresh/api/v1/restart', 'B2: 打到插件自己的路由')
   eq(fetchLog[0].options && fetchLog[0].options.method, 'POST', 'B2: 用 POST')
   eq(fetchLog[0].options && fetchLog[0].options.credentials, 'same-origin', 'B2: 带 same-origin')
+  eq(JSON.parse(fetchLog[0].options.body).mode, 'graceful', 'B2: 请求体声明走优雅方式（不让宿主自杀）')
 
   await new Promise((resolve) => setTimeout(resolve, 0))
   eq(restartItem.textContent, '正在重启…', 'B2: 200 之后显示「正在重启…」')
+  eq(shortcutCloseLog.length, 1, 'B2: 拿到 200 就先请外壳的快捷键服务关窗（官方那条命令）')
+  eq(closeLog.length, 0, 'B2: 有快捷键服务时不退回 window.close')
   await new Promise((resolve) => setTimeout(resolve, 4200))
   eq(restartItem.textContent, '重启应用', 'B2: 提示几秒后自己复原')
+  eq(shortcutCloseLog.length, 2, 'B2: 1.2 秒还没掉线就再请一次关窗')
+  eq(fetchLog.length, 2, 'B2: 关窗没人理时，2.6 秒后补一次兜底请求')
+  eq(JSON.parse(fetchLog[1].options.body).mode, 'force', 'B2: 兜底那次明确要宿主自己退')
 
   restartItem.click()
   eq(restartItem.textContent, '再次点击确认重启', 'B2: 再点一下又进确认状态')
   await new Promise((resolve) => setTimeout(resolve, 3100))
   eq(restartItem.textContent, '重启应用', 'B2: 3 秒不点，确认自己过期')
-  eq(fetchLog.length, 1, 'B2: 过期不算确认，没有多打请求')
+  eq(fetchLog.length, 2, 'B2: 过期不算确认，没有多打请求（那 2 次是重启 + 关窗兜底）')
 
   window.fetch = mockFetch(() => ({ ok: false, status: 405, json: () => Promise.resolve({ error: '只接受 POST' }) }))
   restartItem.click()
   restartItem.click()
   await new Promise((resolve) => setTimeout(resolve, 0))
   eq(restartItem.textContent, '只接受 POST', 'B2: 宿主拒绝时把原因显示出来')
+
+  // ── B2b 没有快捷键服务（web 端 / 服务还没起来）：退回标准 window.close() ──
+  ctx3.dispose()
+  shell3.host.remove()
+  window.fetch = mockFetch(() => ({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, mode: 'graceful' }) }))
+  const closeLog2 = []
+  window.close = () => { closeLog2.push(1) }
+  const shell4 = installShellMenubar()
+  document.body.append(shell4.host)
+  const ctx4 = { handlers: [], on(kind, fn) { this.handlers.push(fn) }, dispose() { this.handlers.slice().forEach((fn) => fn()) } }
+  let apply4Error = null
+  try { mod.apply(ctx4) } catch (error) { apply4Error = error }
+  ok(apply4Error === null, 'B2b: 连 ctx.inject 都没有的 ctx 也不抛')
+  const btn4 = shell4.shadow.querySelector('[data-dsh-ui-refresh-menu]')
+  ok(!!btn4, 'B2b: 按钮重新挂到新菜单条上')
+  const fetchBefore = fetchLog.length
+  if (btn4) btn4.click()
+  const item4 = items()[2]
+  ok(!!item4, 'B2b: 面板里还有「重启应用」')
+  if (item4) {
+    item4.click()
+    item4.click()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    eq(fetchLog.length, fetchBefore + 1, 'B2b: 照样发出重启请求')
+    eq(closeLog2.length, 1, 'B2b: 没有快捷键服务时退回 window.close()')
+    eq(shortcutCloseLog.length, 2, 'B2b: dispose 之后不再用那套快捷键服务')
+  }
 
   render()
 }, 3400)

@@ -132,7 +132,7 @@ const VW = 1280
 const VH = 800
 
 function makeEnv() {
-  const state = { reloadCount: 0, cachesCleared: 0, swUnregistered: 0 }
+  const state = { reloadCount: 0, cachesCleared: 0, swUnregistered: 0, windowCloseCalls: 0, shortcutCloseCalls: 0, injectCalls: [] }
   const errors = []
   const observers = []
   const store = new Map()
@@ -443,6 +443,10 @@ function makeEnv() {
       if (!winListeners.has(type)) winListeners.set(type, [])
       winListeners.get(type).push(fn)
     },
+    /** 优雅重启靠"关掉窗口"让外壳自己退出，所以这里要能数到它被调了几次。 */
+    close() {
+      state.windowCloseCalls += 1
+    },
     removeEventListener(type, fn) {
       const list = winListeners.get(type)
       if (!list) return
@@ -539,7 +543,13 @@ function makeEnv() {
       body.appendChild(host)
       return { host, shadow, menubar, appButton, editButton }
     },
-    makeCtx() {
+    /**
+     * 假 ctx。
+     *   · `options.shortcuts` —— 当作外壳里有客户端快捷键服务（优雅重启要靠它关窗）；
+     *   · `options.noInject`  —— 当作老宿主 / web 端，连 `ctx.inject` 都没有。
+     */
+    makeCtx(options) {
+      const opts = options || {}
       const handlers = {}
       const ctx = {
         handlers,
@@ -554,8 +564,36 @@ function makeEnv() {
           for (const fn of list.slice()) fn()
         },
       }
+      if (opts.shortcuts !== undefined) ctx.shortcuts = opts.shortcuts
+      if (!opts.noInject) {
+        ctx.inject = function inject(deps, run) {
+          state.injectCalls.push(Array.isArray(deps) ? deps.slice() : [])
+          if (typeof run === 'function') {
+            try {
+              run(ctx)
+            } catch (err) {
+              errors.push('inject: ' + (err && err.message ? err.message : String(err)))
+            }
+          }
+          return () => {}
+        }
+      }
       return ctx
     },
+    /** 假的外壳快捷键服务：`closeWindow()` 记一笔，`reject` 时模拟桥不可用。 */
+    makeShortcuts(options) {
+      const opts = options || {}
+      return {
+        closeWindow() {
+          state.shortcutCloseCalls += 1
+          if (opts.reject) return Promise.reject(new Error('Desktop keyboard bridge unavailable'))
+          return Promise.resolve()
+        },
+      }
+    },
+    injectCalls: () => state.injectCalls.slice(),
+    windowCloseCalls: () => state.windowCloseCalls,
+    shortcutCloseCalls: () => state.shortcutCloseCalls,
     tick,
     async flushMicro() {
       await new Promise((resolve) => setImmediate(resolve))
@@ -779,18 +817,28 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   eq(restartCall.url, '/dsh-ui-refresh/api/v1/restart', 'B2: 请求打到插件自己的重启路由')
   eq(restartCall.options && restartCall.options.method, 'POST', 'B2: 用 POST')
   eq(restartCall.options && restartCall.options.credentials, 'same-origin', 'B2: 带 same-origin 凭据')
-  eq(restartCall.options && restartCall.options.body, '{}', 'B2: 请求体是空对象')
+  const restartBody =
+    restartCall.options && typeof restartCall.options.body === 'string' ? JSON.parse(restartCall.options.body) : null
+  eq(restartBody && restartBody.mode, 'graceful', 'B2: 请求体声明走优雅方式（不让宿主自杀）')
   await a.flushMicro()
   eq(restartItem.textContent, '正在重启…', 'B2: 宿主回 200 后显示「正在重启…」')
+  eq(a.windowCloseCalls(), 1, 'B2: 拿到 200 立刻请外壳关窗（没有快捷键服务时退回 window.close）')
   a.tick(4200)
   eq(restartItem.textContent, '重启应用', 'B2: 提示停留几秒后自己复原成「重启应用」')
+  eq(a.fetchCalls().length, 2, 'B2: 关窗没人理时，2.6 秒后自动补一次兜底请求')
+  const forceBody =
+    a.fetchCalls()[1] && a.fetchCalls()[1].options && typeof a.fetchCalls()[1].options.body === 'string'
+      ? JSON.parse(a.fetchCalls()[1].options.body)
+      : null
+  eq(forceBody && forceBody.mode, 'force', 'B2: 兜底那次明确要求宿主自己退（mode=force）')
+  eq(a.windowCloseCalls(), 2, 'B2: 1.2 秒时又补关了一次窗')
 
   // 二次确认 3 秒后自己失效
   guard('B restart rearm', () => restartItem.dispatch('click', {}))
   eq(restartItem.textContent, '再次点击确认重启', 'B2: 又进入确认状态')
   a.tick(3100)
   eq(restartItem.textContent, '重启应用', 'B2: 3 秒不点，确认状态过期复原')
-  eq(a.fetchCalls().length, 1, 'B2: 过期不算确认，没有多打请求')
+  eq(a.fetchCalls().length, 2, 'B2: 过期不算确认，没有多打请求（那 2 次是重启 + 关窗兜底）')
 
   // 关面板要撤销确认状态
   guard('B restart arm2', () => restartItem.dispatch('click', {}))
@@ -823,6 +871,58 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   guard('B2 close', () => a.document.fire('keydown', { key: 'Escape' }))
   ok(!a.panel(), 'B2: 收尾把面板收掉（D 段要从关闭状态开始）')
   eq(a.errors.length, 0, 'B2: 重启流程里没有内部错误', a.errors.join(' | '))
+
+  // ── B3 优雅重启：优先请外壳关窗（官方那条关闭窗口命令），服务不在才退回 window.close ──
+  section('B3 优雅重启：关窗服务 / 兜底')
+  const b3 = makeEnv()
+  b3.buildMenubar()
+  const b3ctx = b3.makeCtx({ shortcuts: b3.makeShortcuts() })
+  guard('B3 apply', () => b3.exports.apply(b3ctx))
+  eq(b3.injectCalls().length, 1, 'B3: 只做了一次运行时注入')
+  eq(b3.injectCalls()[0].join(','), 'shortcuts', 'B3: 注入的正是 shortcuts 服务')
+  const b3btn = b3.menuButton()
+  ok(!!b3btn, 'B3: 标题栏按钮挂上了')
+  guard('B3 open', () => b3btn.dispatch('click', {}))
+  const b3item = b3.panelItems()[2]
+  guard('B3 arm', () => b3item.dispatch('click', {}))
+  guard('B3 go', () => b3item.dispatch('click', {}))
+  await b3.flushMicro()
+  eq(b3.shortcutCloseCalls(), 1, 'B3: 优先请外壳的关窗服务（官方「关闭窗口」走的就是它）')
+  eq(b3.windowCloseCalls(), 0, 'B3: 有关窗服务时不再退回 window.close')
+  b3.tick(1200)
+  eq(b3.shortcutCloseCalls(), 2, 'B3: 1.2 秒还没掉线就再请一次')
+  b3.tick(1500)
+  eq(b3.fetchCalls().length, 2, 'B3: 窗口关不掉时退回让宿主自己退')
+  eq(JSON.parse(b3.fetchCalls()[1].options.body).mode, 'force', 'B3: 兜底那次是 mode=force')
+  eq(b3.errors.length, 0, 'B3: 优雅重启流程没有内部错误', b3.errors.join(' | '))
+  const b3before = b3.fetchCalls().length
+  guard('B3 dispose', () => b3ctx.dispose())
+  b3.tick(20000)
+  eq(b3.fetchCalls().length, b3before, 'B3: dispose 之后关窗兜底的定时器全清掉')
+
+  // 桥报错（服务存在但调用失败）也不能把这颗按钮弄坏
+  const b4 = makeEnv()
+  b4.buildMenubar()
+  const b4ctx = b4.makeCtx({ shortcuts: b4.makeShortcuts({ reject: true }) })
+  guard('B4 apply', () => b4.exports.apply(b4ctx))
+  const b4btn = b4.menuButton()
+  guard('B4 open', () => b4btn.dispatch('click', {}))
+  guard('B4 arm', () => b4.panelItems()[2].dispatch('click', {}))
+  guard('B4 go', () => b4.panelItems()[2].dispatch('click', {}))
+  await b4.flushMicro()
+  eq(b4.shortcutCloseCalls(), 1, 'B4: 关窗被拒也照样请求过一次')
+  eq(b4.windowCloseCalls(), 0, 'B4: 服务在时不重复走 window.close')
+  eq(b4.errors.length, 0, 'B4: 关窗被拒不会变成内部错误', b4.errors.join(' | '))
+  guard('B4 dispose', () => b4ctx.dispose())
+
+  // 老宿主 / web 端：连 ctx.inject 都没有
+  const b5 = makeEnv()
+  b5.buildMenubar()
+  const b5ctx = b5.makeCtx({ noInject: true })
+  guard('B5 apply', () => b5.exports.apply(b5ctx))
+  ok(!!b5.menuButton(), 'B5: 没有 ctx.inject 也照挂按钮')
+  eq(b5.errors.length, 0, 'B5: 没有 ctx.inject 时不报错', b5.errors.join(' | '))
+  guard('B5 dispose', () => b5ctx.dispose())
 
   // ── C 兜底胶囊 ─────────────────────────────────────────────────────────
   section('C 找不到标题栏时的兜底胶囊')
@@ -1138,6 +1238,8 @@ section('G 重启计划：路径 / 计划 / 同源判据')
   })
   eq(made.schema, 1, 'G: 计划带 schema')
   eq(made.pid, 4242, 'G: 计划记住旧 pid')
+  eq(made.mode, 'force', 'G: 不传 mode 时按兜底方式（老客户端 / 老计划兼容）')
+  eq(made.shellPid, null, 'G: 没给 shellPid 就不记（只能等宿主自己）')
   eq(made.args.length, 3, 'G: argv[0] 与 execPath 相同时会被切掉')
   eq(made.args[0], '--expose-internals', 'G: 剩下的参数原样保留')
   eq(made.createdAt, '2026-10-03T00:00:00.000Z', 'G: 时间戳可注入（测试要能假装时间）')
@@ -1153,6 +1255,50 @@ section('G 重启计划：路径 / 计划 / 同源判据')
     electron: false,
   })
   eq(webPlan.fallback, null, 'G: 非 Electron / 非 exe 宿主不给兜底命令')
+
+  const graceful = plan.buildPlan({
+    pid: 4242,
+    shellPid: 5555,
+    argv: ['C:\\App\\app.exe', '--expose-internals', 'host.js', 'profile'],
+    execPath: 'C:\\App\\app.exe',
+    cwd: 'C:\\App',
+    planPath: 'C:\\home\\.dsh\\ui-refresh\\restart-plan.json',
+    logPath: 'C:\\home\\.dsh\\ui-refresh\\restart.log',
+    mode: 'graceful',
+    electron: true,
+  })
+  eq(graceful.mode, 'graceful', 'G: 优雅方式记进计划')
+  eq(graceful.shellPid, 5555, 'G: 优雅方式记下外壳 pid（要等它退）')
+  eq(
+    plan.buildPlan({
+      pid: 4242,
+      shellPid: 4242,
+      argv: ['a'],
+      execPath: 'C:\\App\\app.exe',
+      cwd: 'C:\\App',
+      planPath: 'p',
+      logPath: 'l',
+      mode: 'graceful',
+      electron: true,
+    }).shellPid,
+    null,
+    'G: shellPid 与自己相同就当没给（否则会等自己）',
+  )
+  eq(plan.normalizeMode('graceful'), 'graceful', 'G: 认识 graceful')
+  eq(plan.normalizeMode('force'), 'force', 'G: 认识 force')
+  eq(plan.normalizeMode(undefined), 'force', 'G: 缺省回兜底方式')
+  eq(plan.normalizeMode('乱写的'), 'force', 'G: 不认识的 mode 也回兜底方式，不报错')
+  eq(plan.exitTimeoutFor(made), 30000, 'G: 兜底方式最多等 30 秒')
+  eq(plan.exitTimeoutFor(graceful), 60000, 'G: 优雅方式多等一会儿（用户可能要手点一下「退出」）')
+  const forceTargets = plan.waitTargetsFor(made)
+  eq(forceTargets.length, 1, 'G: 兜底方式只等一个进程')
+  eq(forceTargets[0].pid, 4242, 'G: 兜底方式等的是宿主自己')
+  eq(forceTargets[0].label, '宿主进程', 'G: 标签写清等的是谁')
+  const graceTargets = plan.waitTargetsFor(graceful)
+  eq(graceTargets.length, 1, 'G: 优雅方式也只等一个进程')
+  eq(graceTargets[0].pid, 5555, 'G: 优雅方式等外壳进程（单实例锁在它手里）')
+  eq(graceTargets[0].label, '外壳进程', 'G: 优雅方式的标签是外壳进程')
+
   eq(plan.validatePlan(made).ok, true, 'G: 自家造的计划能过校验')
   eq(plan.validatePlan(made).plan, made, 'G: 校验通过时把计划原样返回')
 
@@ -1166,6 +1312,9 @@ section('G 重启计划：路径 / 计划 / 同源判据')
     [{ ...made, args: ['ok', 42] }, 'args 里有非字符串'],
     [{ ...made, cwd: '' }, 'cwd 为空'],
     [{ ...made, fallback: { execPath: 1 } }, 'fallback 不合法'],
+    [{ ...made, mode: 'graceful-ish' }, 'mode 不认识'],
+    [{ ...made, shellPid: 0 }, 'shellPid 为 0'],
+    [{ ...made, shellPid: '5555' }, 'shellPid 是字符串'],
   ]
   for (const [value, why] of badPlans) {
     const verdict = plan.validatePlan(value)
@@ -1176,10 +1325,16 @@ section('G 重启计划：路径 / 计划 / 同源判据')
   }
   eq(plan.validatePlan({ ...made, fallback: null }).ok, true, 'G: fallback 允许是 null')
   eq(plan.validatePlan({ ...made, fallback: undefined }).ok, true, 'G: fallback 允许缺省')
+  eq(plan.validatePlan({ ...made, mode: undefined }).ok, true, 'G: mode 缺省也合法')
+  eq(plan.validatePlan({ ...made, shellPid: null }).ok, true, 'G: shellPid 允许是 null')
+  eq(plan.validatePlan({ ...made, shellPid: undefined }).ok, true, 'G: shellPid 允许缺省')
 
   const summary = plan.planSummary(made)
   ok(summary.indexOf('pid=4242') >= 0 && summary.indexOf('args=3') >= 0, 'G: 摘要里带 pid 与参数个数')
+  ok(/mode=force/.test(summary) && /shell=-/.test(summary), 'G: 摘要里带方式，没有外壳 pid 就画一个 -')
   ok(/fallback=yes/.test(summary), 'G: 摘要标出有兜底命令')
+  const gracefulSummary = plan.planSummary(graceful)
+  ok(/mode=graceful/.test(gracefulSummary) && /shell=5555/.test(gracefulSummary), 'G: 优雅方式的摘要如实标出')
   ok(/fallback=no/.test(plan.planSummary(webPlan)), 'G: 没有兜底时标 no')
   const line = plan.logLine('helper', 'hi', new Date('2026-10-03T00:00:00.000Z'))
   eq(line, '2026-10-03T00:00:00.000Z [helper] hi\n', 'G: 日志行 = ISO 时间 + 级别 + 内容')
@@ -1253,6 +1408,21 @@ section('H 宿主半边：重启路由')
   function makeReq(method, headers) {
     return { method, headers: headers ?? {} }
   }
+  /** 带请求体的假 request：handler 会挂上 data/end 监听，测完由 `req.feed()` 手动喂给它。 */
+  function makeBodyReq(method, headers, body, options) {
+    const opts = options ?? {}
+    const req = { method, headers: headers ?? {}, handlers: {} }
+    req.on = (type, fn) => {
+      req.handlers[type] = fn
+    }
+    req.feed = () => {
+      for (const chunk of opts.chunks ?? [body]) {
+        if (req.handlers.data) req.handlers.data(chunk)
+      }
+      if (opts.end !== false && req.handlers.end) req.handlers.end()
+    }
+    return req
+  }
   function makeRes() {
     const res = { status: null, headers: null, body: '', finished: [] }
     res.writeHead = (status, headers) => {
@@ -1302,6 +1472,7 @@ section('H 宿主半边：重启路由')
   eq(payload.ok, true, 'H: 回 { ok: true }')
   eq(payload.helperPid, 7000, 'H: 回助手 pid（便于用户去任务管理器看）')
   eq(payload.fallback, true, 'H: 告诉客户端有没有兜底命令')
+  eq(payload.mode, 'force', 'H: 没带 mode 的请求（老客户端）按兜底方式')
   eq(res200.headers && res200.headers['cache-control'], 'no-store', 'H: 不许缓存这个响应')
   eq(okHost.spawns.length, 1, 'H: 只拉起一个助手')
   const spawnCall = okHost.spawns[0]
@@ -1320,6 +1491,8 @@ section('H 宿主半边：重启路由')
   eq(written.execPath, 'C:\\App\\app.exe', 'H: 计划记下可执行文件')
   eq(written.args.length, 2, 'H: 计划记下原样参数')
   eq(written.fallback !== null, true, 'H: 计划带兜底命令')
+  eq(written.mode, 'force', 'H: 计划里记下这次是哪一种方式')
+  eq(written.shellPid, process.ppid, 'H: 记下外壳 pid（优雅方式要等它退出）')
   ok(okHost.logs.join('').indexOf('收到重启请求') >= 0, 'H: 写了一条"收到请求"日志')
 
   const res409 = makeRes()
@@ -1333,6 +1506,56 @@ section('H 宿主半边：重启路由')
   eq(okHost.exited.length, 0, 'H: 延时到点之前不退出')
   okHost.later[0]()
   eq(okHost.exited[0], 0, 'H: 退出码 0')
+
+  // 优雅方式：客户端默认走这条，宿主**不许自己退**
+  const graceHost = makeHost()
+  const graceReq = makeBodyReq('POST', { host: '127.0.0.1:19387' }, '{"mode":"graceful"}')
+  const resGrace = makeRes()
+  graceHost.route.handler(graceReq, resGrace)
+  eq(resGrace.status, null, 'H: 请求体还没读完就不回（别抢答）')
+  graceReq.feed()
+  eq(resGrace.status, 200, 'H: 优雅方式也回 200')
+  eq(JSON.parse(resGrace.body).mode, 'graceful', 'H: 回包里告诉客户端这次是优雅方式')
+  eq(graceHost.spawns.length, 1, 'H: 优雅方式照样先拉起助手')
+  const gracePlan = JSON.parse(graceHost.plans[0].text)
+  eq(gracePlan.mode, 'graceful', 'H: 计划里记下优雅方式')
+  eq(gracePlan.shellPid, process.ppid, 'H: 计划里记下外壳 pid')
+  ok(graceHost.logs.join('').indexOf('优雅') >= 0, 'H: 日志里写清是优雅方式')
+  resGrace.finish()
+  eq(graceHost.later.length, 0, 'H: 优雅方式绝不排那个自杀延时')
+  eq(graceHost.exited.length, 0, 'H: 优雅方式宿主自己不退（退不退由外壳决定）')
+
+  // 读不清 body 一律当兜底方式，绝不因此拒绝重启
+  const muddled = [
+    ['{"mode":"乱写的"}', '不认识的 mode'],
+    ['{不是 JSON', '坏 JSON'],
+    ['', '空 body'],
+    ['null', 'body 是 null'],
+  ]
+  for (const [body, why] of muddled) {
+    const host = makeHost()
+    const req = makeBodyReq('POST', { host: '127.0.0.1:19387' }, body)
+    const res = makeRes()
+    host.route.handler(req, res)
+    req.feed()
+    eq(res.status, 200, `H: ${why}也照样重启（不拒绝）`)
+    eq(JSON.parse(res.body).mode, 'force', `H: ${why}按兜底方式`)
+  }
+
+  const fatHost = makeHost()
+  const fatReq = makeBodyReq('POST', { host: '127.0.0.1:19387' }, 'x'.repeat(5000), { end: false })
+  const resFat = makeRes()
+  fatHost.route.handler(fatReq, resFat)
+  fatReq.feed()
+  eq(resFat.status, 200, 'H: 请求体超长就直接按兜底方式走（不无限等）')
+  eq(JSON.parse(resFat.body).mode, 'force', 'H: 超长体也是 force')
+
+  const errHost = makeHost()
+  const errReq = makeBodyReq('POST', { host: '127.0.0.1:19387' }, '')
+  const resErr = makeRes()
+  errHost.route.handler(errReq, resErr)
+  if (errReq.handlers.error) errReq.handlers.error(new Error('连接断了'))
+  eq(resErr.status, 200, 'H: 读 body 出错也照样按兜底方式重启')
 
   const plainHost = makeHost()
   plainHost.route.handler(makeReq('POST', {}), { writeHead() {}, end() {} })
@@ -1412,6 +1635,8 @@ section('I 分离助手：等旧的死 / 原样重放 / 兜底')
   eq(okCase.result.pid, 8000, 'I: 返回新进程 pid')
   eq(okCase.calls.waits.length, 1, 'I: 先等旧进程退出')
   eq(okCase.calls.waits[0].pid, 4242, 'I: 等的是计划里的 pid')
+  eq(okCase.calls.waits[0].options.timeoutMs, 30000, 'I: 兜底方式最多等 30 秒')
+  ok(okCase.calls.log.join('').indexOf('宿主进程 4242') >= 0, 'I: 日志里写清等的是宿主')
   eq(okCase.calls.launches.length, 1, 'I: 只起了一个进程')
   eq(okCase.calls.launches[0].target.execPath, 'C:\\App\\app.exe', 'I: 用计划里的可执行文件')
   eq(okCase.calls.launches[0].target.args.length, 2, 'I: 参数原样重放')
@@ -1422,6 +1647,35 @@ section('I 分离助手：等旧的死 / 原样重放 / 兜底')
   const stuck = runCase({ waitResult: { exited: false, waitedMs: 30000 } })
   eq(stuck.result.ok, true, 'I: 旧进程超时没死也照样起新的')
   ok(stuck.calls.log.join('').indexOf('仍然按计划启动') >= 0, 'I: 超时会写一条警告日志')
+
+  // 优雅方式：等外壳进程、先走"等同双击桌面图标"
+  const graceCase = runCase({ plan: { mode: 'graceful', shellPid: 5555 } })
+  eq(graceCase.result.ok, true, 'I: 优雅方式正常跑通')
+  eq(graceCase.calls.waits.length, 1, 'I: 优雅方式只等一个进程')
+  eq(graceCase.calls.waits[0].pid, 5555, 'I: 优雅方式等的是外壳 pid')
+  eq(graceCase.calls.waits[0].options.timeoutMs, 60000, 'I: 优雅方式多等一会儿（用户可能要手点「退出」）')
+  ok(graceCase.calls.log.join('').indexOf('外壳进程 5555') >= 0, 'I: 日志里写清等的是外壳')
+  ok(graceCase.calls.log.join('').indexOf('优雅退出') >= 0, 'I: 日志里写明这是优雅方式')
+  eq(graceCase.result.mode, 'fallback', 'I: 优雅方式先走"等同双击桌面图标"那条')
+  eq(graceCase.calls.launches.length, 1, 'I: 第一条起来就够了')
+  eq(graceCase.calls.launches[0].target.args.length, 0, 'I: 第一条命令不带参数')
+  eq(graceCase.calls.launches[0].target.cwd, 'C:\\App', 'I: 第一条命令在 exe 自己的目录里')
+  ok(graceCase.calls.sleeps.indexOf(1500) >= 0, 'I: 起之前先等一下，让系统把单实例锁放开')
+
+  const stuckShell = runCase({
+    waitResult: { exited: false, waitedMs: 60000 },
+    plan: { mode: 'graceful', shellPid: 5555 },
+  })
+  eq(stuckShell.result.ok, false, 'I: 外壳没退就绝不硬起新进程（新实例抢不到锁会自杀）')
+  eq(stuckShell.calls.launches.length, 0, 'I: 一条命令都不发')
+  ok(String(stuckShell.result.reason).indexOf('外壳还在运行') >= 0, 'I: 说清是外壳还在')
+  ok(stuckShell.calls.log.join('').indexOf('不再启动新进程') >= 0, 'I: 日志里给出人工出路（托盘 → 退出）')
+
+  const graceReplay = runCase({ dead: [0], plan: { mode: 'graceful', shellPid: 5555 } })
+  eq(graceReplay.result.ok, true, 'I: 优雅方式第一条起不来，还有原样重放兜着')
+  eq(graceReplay.calls.launches.length, 2, 'I: 优雅方式也会起第二次')
+  eq(graceReplay.calls.launches[1].target.args.length, 2, 'I: 第二条才是原样重放（参数齐全）')
+  eq(graceReplay.result.mode, 'replay', 'I: 第二次成功就算原样重放')
 
   const fell = runCase({ dead: [0] })
   eq(fell.result.ok, true, 'I: 回退到兜底后算成功')
@@ -1434,7 +1688,7 @@ section('I 分离助手：等旧的死 / 原样重放 / 兜底')
 
   const both = runCase({ dead: [0, 1] })
   eq(both.result.ok, false, 'I: 兜底也起不来就报失败')
-  ok(String(both.result.reason).indexOf('兜底') >= 0, 'I: 说清是兜底也失败')
+  ok(String(both.result.reason).indexOf('起不来') >= 0, 'I: 说清两种方式都没起来')
   ok(both.calls.log.join('').indexOf('请手动双击桌面图标') >= 0, 'I: 日志里给出人工出路')
 
   const noFallback = runCase({ dead: [0], plan: { fallback: null } })
