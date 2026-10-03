@@ -1,0 +1,51 @@
+{
+  "name": "dsh-ui-refresh",
+  "version": "0.2.0",
+  "description": "在标题栏「应用 / 编辑」旁边加一颗自己的「刷新」菜单（下拉：刷新界面 / 清空缓存并刷新）；万一找不到标题栏，就退回右下角一颗可拖动的胶囊。用来补上官方桌面外壳缺失的 F5 / Ctrl+R：只重新加载当前窗口，刚热挂载或刚启用的插件 UI、主题切换刷新即到；插件本体的代码更新仍需完全退出应用重开。DSH web plugin: a refresh menu injected into the title bar, with a draggable fallback button.",
+  "type": "module",
+  "main": "lib/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/selftest.mjs",
+    "check": "node --check lib/index.js && node --check lib/client.js && node test/selftest.mjs"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "cordis": "^4.0.0-rc.10"
+  },
+  "peerDependenciesMeta": {
+    "cordis": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "refresh",
+    "reload",
+    "titlebar",
+    "toolbar",
+    "menu"
+  ],
+  "license": "MIT"
+}

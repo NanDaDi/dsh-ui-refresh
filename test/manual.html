@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>dsh-ui-refresh · 真浏览器对照测试</title>
+<style>
+  html, body { margin: 0; background: #15171c; color: #e6e8ee;
+    font-family: system-ui, "Microsoft YaHei", sans-serif; }
+  #report { padding: 44px 16px 16px; white-space: pre-wrap;
+    font: 12px/1.7 ui-monospace, Consolas, monospace; }
+  #head { position: fixed; inset: 0 auto auto 0; padding: 6px 10px; font: 12px/1.4 system-ui;
+    color: #aab; background: #1d2027; border-radius: 0 0 8px 0; z-index: 5; }
+</style>
+</head>
+<body>
+<div id="head">dsh-ui-refresh · 对照测试（复刻 app.asar 的 installWindowsMenu）</div>
+<div id="report">running…</div>
+
+<script>
+/*
+ * 复刻官方外壳的标题栏菜单条：<div data-windows-menu> + open shadow root +
+ * [role=menubar] + 两颗按钮。CSS 与按钮属性逐字抄自 app.asar 里的 installWindowsMenu()。
+ */
+window.__entry = null
+window.__ModuleLoader__ = { load(entry) { window.__entry = entry } }
+
+/* 页面级异常也要算进结果，而不是让报告停在 running… */
+window.__ERRORS__ = []
+function notePageError(message) {
+  window.__ERRORS__.push(message)
+  if (window.__LINES__ && window.__TALLY__) {
+    window.__TALLY__.fail++
+    window.__LINES__.push('✗ 页面异常：' + message)
+    if (typeof window.__flush === 'function') window.__flush()
+  }
+}
+window.addEventListener('error', (event) => {
+  notePageError(String((event && (event.message || event.error)) || 'error'))
+})
+window.addEventListener('unhandledrejection', (event) => {
+  notePageError('rejection: ' + String(event && event.reason))
+})
+
+function installShellMenubar() {
+  const host = document.createElement('div')
+  host.dataset.windowsMenu = ''
+  const shadow = host.attachShadow({ mode: 'open' })
+  const style = document.createElement('style')
+  style.textContent = `
+    :host { position: fixed; top: 0; left: var(--dsh-windows-menu-start, 48px); z-index: 1100;
+      height: var(--dsh-windows-titlebar-height); display: flex; align-items: center;
+      font-family: var(--dsw-font-family); -webkit-app-region: no-drag; }
+    [role=menubar] { display: flex; gap: 2px; }
+    button { height: 28px; padding: 0 10px; border: 0; border-radius: 6px;
+      background: transparent; color: var(--dsw-alias-label-secondary);
+      font: inherit; font-size: 14px; cursor: default; }
+    button:hover, button[aria-expanded=true] { background: var(--dsw-alias-interactive-bg-hover);
+      color: var(--dsw-alias-label-primary); }
+    button:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary); outline-offset: -2px; }
+    :host-context(html[data-input-modality='pointer']) button:focus-visible { outline-color: transparent; }
+  `
+  const bar = document.createElement('div')
+  bar.setAttribute('role', 'menubar')
+  const buttons = []
+  const createButton = (name, index) => {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.setAttribute('role', 'menuitem')
+    button.setAttribute('aria-haspopup', 'menu')
+    button.setAttribute('aria-expanded', 'false')
+    button.tabIndex = index === 0 ? 0 : -1
+    button.textContent = name === 'application' ? '应用' : '编辑'
+    // 官方那两颗会吃掉 pointerdown / mousedown 的默认行为
+    button.addEventListener('pointerdown', (event) => { event.preventDefault() })
+    button.addEventListener('mousedown', (event) => { event.preventDefault() })
+    button.addEventListener('click', () => {
+      button.setAttribute('aria-expanded', 'true')
+      window.__nativeMenuOpened = name // 真外壳这里走 ipcRenderer.invoke 弹原生菜单
+      setTimeout(() => button.setAttribute('aria-expanded', 'false'), 60)
+    })
+    button.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault()
+        const next = buttons[index === 0 ? 1 : 0]
+        button.tabIndex = -1
+        next.tabIndex = 0
+        next.focus()
+      }
+    })
+    bar.append(button)
+    return button
+  }
+  buttons.push(createButton('application', 0), createButton('edit', 1))
+  shadow.append(style, bar)
+  return { host, shadow, bar, appButton: buttons[0], editButton: buttons[1] }
+}
+</script>
+
+<script src="../lib/client.js"></script>
+
+<script>
+const shell = installShellMenubar()
+document.body.append(shell.host)
+
+const lines = []
+const tally = { pass: 0, fail: 0 }
+window.__LINES__ = lines
+window.__TALLY__ = tally
+function render() {
+  window.__RESULT__ = { pass: tally.pass, fail: tally.fail, lines: lines, pageErrors: window.__ERRORS__ }
+  const report = document.getElementById('report')
+  report.textContent = '通过 ' + tally.pass + ' / 失败 ' + tally.fail +
+    ' / 页面异常 ' + window.__ERRORS__.length + '\n\n' + lines.join('\n')
+  report.style.color = tally.fail === 0 ? '#cde' : '#fbb'
+  document.title = 'dsh-ui-refresh result: pass=' + tally.pass + ' fail=' + tally.fail
+}
+window.__flush = render
+function ok(cond, name, extra) {
+  if (cond) { tally.pass++; lines.push('✓ ' + name) }
+  else { tally.fail++; lines.push('✗ ' + name + (extra ? '   —— ' + extra : '')) }
+}
+function eq(got, want, name) { ok(Object.is(got, want), name, 'expected ' + String(want) + ', got ' + String(got)) }
+function near(got, want, tol, name) {
+  ok(typeof got === 'number' && Math.abs(got - want) <= tol, name, 'expected ~' + want + ', got ' + got)
+}
+const $ = (sel, root) => (root || document).querySelector(sel)
+const panel = () => $('[data-dsh-ui-refresh-panel]')
+const items = () => Array.prototype.slice.call(document.querySelectorAll('[data-dsh-ui-refresh-item]'))
+const ourBtn = () => shell.shadow.querySelector('button[data-dsh-ui-refresh-menu]')
+const oursButtons = () => shell.shadow.querySelectorAll('button[data-dsh-ui-refresh-menu]')
+function pointerdownOn(el) {
+  el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, composed: true, cancelable: true }))
+}
+
+// ── A 挂载 ────────────────────────────────────────────────────────────────
+const entry = window.__entry
+ok(!!entry && typeof entry.factory === 'function', 'A: 捕获到 ModuleLoader 条目')
+const mod = entry ? entry.factory(() => ({})) : null
+ok(mod && Array.isArray(mod.inject) && mod.inject.length === 0, 'A: inject 为空数组')
+const ctx = { handlers: [], on(kind, fn) { this.handlers.push(fn) }, dispose() { this.handlers.slice().forEach((fn) => fn()) } }
+let applyError = null
+try { mod.apply(ctx) } catch (error) { applyError = error }
+ok(applyError === null, 'A: apply 不抛异常', applyError && applyError.message)
+
+eq(oursButtons().length, 1, 'A: 菜单条里多出恰好一颗我们的按钮')
+eq(shell.bar.children.length, 3, 'A: 我们排在「应用」「编辑」之后')
+eq(shell.bar.children[2], ourBtn(), 'A: 在菜单条最后一位')
+eq(ourBtn() && ourBtn().textContent, '刷新', 'A: 文案是「刷新」')
+eq(ourBtn() && ourBtn().getAttribute('aria-haspopup'), 'menu', 'A: aria-haspopup=menu')
+eq(ourBtn() && ourBtn().getAttribute('aria-expanded'), 'false', 'A: 初始 aria-expanded=false')
+ok(!!(ourBtn() && ourBtn().getAttribute('title')), 'A: 有 tooltip 说明')
+eq($('[data-dsh-ui-refresh]'), null, 'A: 标题栏能用时不出兜底胶囊')
+
+const shadowStyle = shell.shadow.querySelector('#dsh-ui-refresh-shadow-style')
+ok(!!shadowStyle, 'A: 样式注进 shadow root（不是 head）')
+eq(document.querySelectorAll('style[id="dsh-ui-refresh-shadow-style"]').length, 0, 'A: head 里没有那张 shadow 样式')
+const pageStyle = document.getElementById('dsh-ui-refresh-style')
+ok(!!pageStyle, 'A: 面板样式注入 document.head')
+
+// 真级联：我们的按钮必须和官方那两颗长得一模一样
+const cs = getComputedStyle(ourBtn())
+const csApp = getComputedStyle(shell.appButton)
+eq(cs.height, csApp.height, 'A: 高度与「应用」一致')
+eq(cs.fontSize, csApp.fontSize, 'A: 字号与「应用」一致（14px）')
+eq(cs.color, csApp.color, 'A: 文字色与「应用」一致')
+eq(cs.backgroundColor, csApp.backgroundColor, 'A: 底色与「应用」一致（未悬停都透明）')
+eq(cs.borderRadius, csApp.borderRadius, 'A: 圆角一致')
+eq(cs.paddingLeft, csApp.paddingLeft, 'A: 内边距一致')
+eq(cs.cursor, csApp.cursor, 'A: 光标一致（不给手型）')
+eq(cs.getPropertyValue('-webkit-app-region').trim(), 'no-drag', 'A: 带 no-drag（点它不拖窗口）')
+eq(cs.lineHeight, csApp.lineHeight, 'A: 行高一致')
+
+// ── B 下拉面板 ────────────────────────────────────────────────────────────
+const rectBefore = ourBtn().getBoundingClientRect()
+ourBtn().click()
+const box = panel()
+ok(!!box, 'B: 点一下开出面板')
+eq(box && box.parentNode, document.body, 'B: 面板挂在 body 上（浮层）')
+eq(box && box.getAttribute('role'), 'menu', 'B: 面板 role=menu')
+eq(ourBtn().getAttribute('aria-expanded'), 'true', 'B: 展开态写回 aria-expanded')
+eq(items().length, 2, 'B: 两项')
+eq(items()[0] && items()[0].textContent, '刷新界面', 'B: 第一项是刷新界面')
+eq(items()[1] && items()[1].textContent, '清空缓存并刷新', 'B: 第二项是清空缓存并刷新')
+eq(items().map((it) => it.getAttribute('role')).join(','), 'menuitem,menuitem', 'B: 两项都是 menuitem')
+eq(document.activeElement, items()[0], 'B: 打开后焦点落在第一项')
+const boxRect = box.getBoundingClientRect()
+near(boxRect.left, rectBefore.left, 2, 'B: 面板左边贴着按钮左边')
+near(boxRect.top, rectBefore.bottom + 4, 2, 'B: 面板顶边在按钮下方 4px')
+eq(box && getComputedStyle(box).position, 'fixed', 'B: 面板是 fixed 定位')
+
+// 点外面关掉（冒泡阶段的 pointerdown）
+pointerdownOn(document.body)
+eq(panel(), null, 'B: 点面板外面关掉')
+eq(ourBtn().getAttribute('aria-expanded'), 'false', 'B: 关掉后 aria-expanded=false')
+// shadow 里的焦点元素会被 retarget 到宿主 div，所以要看 shadow root 自己的 activeElement
+eq(shell.shadow.activeElement, ourBtn(), 'B: 关掉后焦点还给按钮')
+
+// Escape 关掉
+ourBtn().click()
+ok(!!panel(), 'B: 再开一次')
+document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+eq(panel(), null, 'B: Escape 关掉')
+
+// 关键回归：点自己的按钮 = pointerdown + click，必须能开也能关
+ourBtn().click()
+ok(!!panel(), 'B: 第三次打开')
+pointerdownOn(ourBtn())
+ourBtn().click()
+eq(panel(), null, 'B: 点自己的按钮能把面板收起来（pointerdown 没抢跑）')
+ourBtn().click()
+ok(!!panel(), 'B: 再点又开（toggle 正常）')
+
+// 面板内部 pointerdown 不该把自己关掉
+pointerdownOn(items()[0])
+ok(!!panel(), 'B: 面板内部按下不会自关')
+// 点「应用」：我们的面板收起，原生菜单照弹
+pointerdownOn(shell.appButton)
+shell.appButton.click()
+eq(panel(), null, 'B: 点「应用」时自己的面板收起')
+eq(window.__nativeMenuOpened, 'application', 'B: 「应用」的原生菜单照常弹（我们没拦它）')
+
+// 方向键 / Tab
+ourBtn().click()
+document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }))
+eq(document.activeElement, items()[1], 'B: ArrowDown 走到第二项')
+document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }))
+eq(document.activeElement, items()[0], 'B: ArrowUp 走回第一项')
+document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }))
+eq(panel(), null, 'B: Tab 收起面板')
+
+// ── C 窗口 resize 时面板跟着按钮 ──────────────────────────────────────────
+ourBtn().click()
+const leftBefore = panel().getBoundingClientRect().left
+shell.host.style.left = '300px'
+window.dispatchEvent(new Event('resize'))
+const leftAfter = panel().getBoundingClientRect().left
+ok(Math.abs(leftAfter - leftBefore) > 100, 'C: 窗口 resize 后面板跟着按钮重定位',
+  'before ' + leftBefore + ', after ' + leftAfter)
+shell.host.style.left = '48px'
+ourBtn().click() // 收起
+
+// ── D dispose 收干净 ─────────────────────────────────────────────────────
+ctx.dispose()
+eq(oursButtons().length, 0, 'D: 按钮摘掉')
+eq(shell.bar.children.length, 2, 'D: 官方两颗按钮原样还在')
+eq(shell.shadow.querySelector('#dsh-ui-refresh-shadow-style'), null, 'D: shadow 里的样式摘掉')
+eq(document.getElementById('dsh-ui-refresh-style'), null, 'D: head 里的样式摘掉')
+eq(panel(), null, 'D: 面板摘掉')
+eq(document.activeElement, document.body, 'D: 焦点没有留在不存在的节点上')
+
+// ── E 找不到标题栏时，3 秒后退回胶囊 ──────────────────────────────────────
+shell.host.remove()
+const ctx2 = { handlers: [], on(kind, fn) { this.handlers.push(fn) }, dispose() { this.handlers.slice().forEach((fn) => fn()) } }
+let apply2Error = null
+try { mod.apply(ctx2) } catch (error) { apply2Error = error }
+ok(apply2Error === null, 'E: 无标题栏时 apply 也不抛')
+eq($('[data-dsh-ui-refresh]'), null, 'E: 刚起步不急着出胶囊')
+
+setTimeout(() => {
+  const pill = $('[data-dsh-ui-refresh]')
+  ok(!!pill, 'E: 3 秒后兜底胶囊出现')
+  ok(!!(pill && pill.querySelector('button')), 'E: 胶囊里有按钮')
+  ok(!!(pill && pill.querySelector('button') &&
+    pill.querySelector('button').textContent.indexOf('刷新') >= 0), 'E: 按钮上是刷新')
+  const pillCs = pill ? getComputedStyle(pill) : null
+  eq(pillCs && pillCs.position, 'fixed', 'E: 胶囊是浮层')
+  ok(!!(pillCs && pillCs.right), 'E: 胶囊贴右边')
+  eq($('[data-dsh-ui-refresh-panel]'), null, 'E: 没有标题栏时不乱开面板')
+
+  render()
+}, 3400)
+</script>
+</body>
+</html>
