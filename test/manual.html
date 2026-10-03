@@ -128,6 +128,16 @@ const panel = () => $('[data-dsh-ui-refresh-panel]')
 const items = () => Array.prototype.slice.call(document.querySelectorAll('[data-dsh-ui-refresh-item]'))
 const ourBtn = () => shell.shadow.querySelector('button[data-dsh-ui-refresh-menu]')
 const oursButtons = () => shell.shadow.querySelectorAll('button[data-dsh-ui-refresh-menu]')
+// 「重启应用」会 POST 一条路由；把 fetch 换成记录器（真外壳里才是那个 webServer）
+const fetchLog = []
+function mockFetch(respond) {
+  return function (url, options) {
+    fetchLog.push({ url: url, options: options })
+    return Promise.resolve(respond())
+  }
+}
+window.fetch = mockFetch(() => ({ ok: true, status: 200, json: () => Promise.resolve({ ok: true, helperPid: 4242 }) }))
+
 function pointerdownOn(el) {
   el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, composed: true, cancelable: true }))
 }
@@ -178,10 +188,11 @@ ok(!!box, 'B: 点一下开出面板')
 eq(box && box.parentNode, document.body, 'B: 面板挂在 body 上（浮层）')
 eq(box && box.getAttribute('role'), 'menu', 'B: 面板 role=menu')
 eq(ourBtn().getAttribute('aria-expanded'), 'true', 'B: 展开态写回 aria-expanded')
-eq(items().length, 2, 'B: 两项')
+eq(items().length, 3, 'B: 三项')
 eq(items()[0] && items()[0].textContent, '刷新界面', 'B: 第一项是刷新界面')
 eq(items()[1] && items()[1].textContent, '清空缓存并刷新', 'B: 第二项是清空缓存并刷新')
-eq(items().map((it) => it.getAttribute('role')).join(','), 'menuitem,menuitem', 'B: 两项都是 menuitem')
+eq(items()[2] && items()[2].textContent, '重启应用', 'B: 第三项是重启应用')
+eq(items().map((it) => it.getAttribute('role')).join(','), 'menuitem,menuitem,menuitem', 'B: 三项都是 menuitem')
 eq(document.activeElement, items()[0], 'B: 打开后焦点落在第一项')
 const boxRect = box.getBoundingClientRect()
 near(boxRect.left, rectBefore.left, 2, 'B: 面板左边贴着按钮左边')
@@ -256,7 +267,7 @@ try { mod.apply(ctx2) } catch (error) { apply2Error = error }
 ok(apply2Error === null, 'E: 无标题栏时 apply 也不抛')
 eq($('[data-dsh-ui-refresh]'), null, 'E: 刚起步不急着出胶囊')
 
-setTimeout(() => {
+setTimeout(async () => {
   const pill = $('[data-dsh-ui-refresh]')
   ok(!!pill, 'E: 3 秒后兜底胶囊出现')
   ok(!!(pill && pill.querySelector('button')), 'E: 胶囊里有按钮')
@@ -266,6 +277,52 @@ setTimeout(() => {
   eq(pillCs && pillCs.position, 'fixed', 'E: 胶囊是浮层')
   ok(!!(pillCs && pillCs.right), 'E: 胶囊贴右边')
   eq($('[data-dsh-ui-refresh-panel]'), null, 'E: 没有标题栏时不乱开面板')
+
+  // ── B2 「重启应用」：真 DOM / 真事件路径下的两段式确认 ──────────────────
+  const shell3 = installShellMenubar()
+  document.body.append(shell3.host)
+  const ctx3 = { handlers: [], on(kind, fn) { this.handlers.push(fn) }, dispose() { this.handlers.slice().forEach((fn) => fn()) } }
+  let apply3Error = null
+  try { mod.apply(ctx3) } catch (error) { apply3Error = error }
+  ok(apply3Error === null, 'B2: 标题栏回来时 apply 不抛')
+
+  const btn3 = shell3.shadow.querySelector('[data-dsh-ui-refresh-menu]')
+  ok(!!btn3, 'B2: 菜单条回来后又挂上我们那颗按钮')
+  eq(btn3 && btn3.textContent, '刷新', 'B2: 按钮文案仍是刷新')
+  if (btn3) btn3.click()
+  const three = items()
+  eq(three.length, 3, 'B2: 面板三项')
+  eq(three[2] && three[2].textContent, '重启应用', 'B2: 第三项是「重启应用」')
+  const restartItem = three[2]
+  ok(!!restartItem, 'B2: 重启项找得到')
+
+  restartItem.click()
+  eq(fetchLog.length, 0, 'B2: 点第一下不发请求')
+  eq(restartItem.textContent, '再次点击确认重启', 'B2: 第一下变成二次确认')
+  ok(!!$('[data-dsh-ui-refresh-panel]'), 'B2: 确认状态下面板不关')
+
+  restartItem.click()
+  eq(fetchLog.length, 1, 'B2: 点第二下发出一次请求')
+  eq(fetchLog[0].url, '/dsh-ui-refresh/api/v1/restart', 'B2: 打到插件自己的路由')
+  eq(fetchLog[0].options && fetchLog[0].options.method, 'POST', 'B2: 用 POST')
+  eq(fetchLog[0].options && fetchLog[0].options.credentials, 'same-origin', 'B2: 带 same-origin')
+
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  eq(restartItem.textContent, '正在重启…', 'B2: 200 之后显示「正在重启…」')
+  await new Promise((resolve) => setTimeout(resolve, 4200))
+  eq(restartItem.textContent, '重启应用', 'B2: 提示几秒后自己复原')
+
+  restartItem.click()
+  eq(restartItem.textContent, '再次点击确认重启', 'B2: 再点一下又进确认状态')
+  await new Promise((resolve) => setTimeout(resolve, 3100))
+  eq(restartItem.textContent, '重启应用', 'B2: 3 秒不点，确认自己过期')
+  eq(fetchLog.length, 1, 'B2: 过期不算确认，没有多打请求')
+
+  window.fetch = mockFetch(() => ({ ok: false, status: 405, json: () => Promise.resolve({ error: '只接受 POST' }) }))
+  restartItem.click()
+  restartItem.click()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  eq(restartItem.textContent, '只接受 POST', 'B2: 宿主拒绝时把原因显示出来')
 
   render()
 }, 3400)

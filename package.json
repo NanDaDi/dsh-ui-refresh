@@ -1,7 +1,7 @@
 {
   "name": "dsh-ui-refresh",
-  "version": "0.2.1",
-  "description": "在标题栏「应用 / 编辑」旁边加一颗自己的「刷新」菜单（下拉：刷新界面 / 清空缓存并刷新）；万一找不到标题栏，就退回右下角一颗可拖动的胶囊。用来补上官方桌面外壳缺失的 F5 / Ctrl+R：只重新加载当前窗口，刚热挂载或刚启用的插件 UI、主题切换刷新即到；插件本体的代码更新仍需完全退出应用重开。DSH web plugin: a refresh menu injected into the title bar, with a draggable fallback button.",
+  "version": "0.3.0",
+  "description": "在标题栏「应用 / 编辑」旁边加一颗自己的「刷新」菜单（下拉：刷新界面 / 清空缓存并刷新 / 重启应用）；万一找不到标题栏，就退回右下角一颗可拖动的胶囊。刷新用来补上官方桌面外壳缺失的 F5 / Ctrl+R：只重新加载当前窗口，刚热挂载或刚启用的插件 UI、主题切换刷新即到；插件本体的代码更新、条目表变化则由「重启应用」一键重启宿主完成 —— 客户端 POST 插件自己注册的本地路由，分离助手等旧进程死透后用同一套参数重开，起不来还会退回双击桌面图标那条路。DSH web plugin: a refresh + restart menu injected into the title bar, with a draggable fallback button.",
   "type": "module",
   "main": "lib/index.js",
   "engines": {
@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "node test/selftest.mjs",
-    "check": "node --check lib/index.js && node --check lib/client.js && node test/selftest.mjs"
+    "check": "node --check lib/index.js && node --check lib/client.js && node --check lib/restart-plan.js && node --check lib/restart-helper.js && node test/selftest.mjs"
   },
   "exports": {
     ".": {
@@ -49,7 +49,8 @@
     "reload",
     "titlebar",
     "toolbar",
-    "menu"
+    "menu",
+    "restart"
   ],
   "license": "MIT"
 }

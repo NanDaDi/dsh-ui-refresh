@@ -15,7 +15,9 @@
 import { readFileSync } from 'node:fs'
 import { createContext, runInContext } from 'node:vm'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import * as plan from '../lib/restart-plan.js'
+import * as helper from '../lib/restart-helper.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
@@ -34,11 +36,27 @@ function ok(cond, name, detail) {
   }
 }
 
+/** 断言失败时的可读值：DOM 替身有环形引用，不能直接 JSON.stringify。 */
+function fmt(value) {
+  try {
+    if (value === null || value === undefined) return String(value)
+    if (typeof value === 'string') return JSON.stringify(value)
+    if (typeof value === 'object') {
+      const tag = value.tagName ? '<' + String(value.tagName).toLowerCase() + '>' : Object.prototype.toString.call(value)
+      const id = value.getAttribute ? value.getAttribute('data-dsh-ui-refresh-item') : ''
+      return tag + (id ? '[' + id + ']' : '')
+    }
+    return String(value)
+  } catch {
+    return Object.prototype.toString.call(value)
+  }
+}
+
 function eq(actual, expected, name) {
   ok(
     Object.is(actual, expected),
     name,
-    actual === expected ? '' : `期望 ${JSON.stringify(expected)}，实际 ${JSON.stringify(actual)}`,
+    actual === expected ? '' : `期望 ${fmt(expected)}，实际 ${fmt(actual)}`,
   )
 }
 
@@ -441,6 +459,27 @@ function makeEnv() {
       return event
     },
   }
+  // fetch 替身（「重启应用」用）：默认 200 { ok: true }，可切换成各种失败
+  const fetchState = { calls: [], mode: 'ok' }
+  function fakeFetch(url, options) {
+    fetchState.calls.push({ url: url, options: options })
+    switch (fetchState.mode) {
+      case 'throw':
+        throw new Error('同步抛出的网络错误')
+      case 'reject':
+        return Promise.reject(new Error('网络不可达'))
+      case '405':
+        return Promise.resolve({ ok: false, status: 405, json: async () => ({ error: '只接受 POST' }) })
+      case '409':
+        return Promise.resolve({ ok: false, status: 409, json: async () => ({ error: '正在重启' }) })
+      case 'nojson':
+        return Promise.resolve({ ok: true, status: 200 })
+      default:
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, helperPid: 4242 }) })
+    }
+  }
+  win.fetch = fakeFetch
+
   win.setTimeout = fakeSetTimeout
   win.clearTimeout = fakeClear
   win.MutationObserver = FakeObserver
@@ -456,6 +495,7 @@ function makeEnv() {
     window: win,
     document: doc,
     console,
+    fetch: fakeFetch,
     setTimeout: fakeSetTimeout,
     clearTimeout: fakeClear,
     setInterval: fakeSetInterval,
@@ -566,6 +606,15 @@ function makeEnv() {
       return panel ? findAll(panel.children, 'button[data-dsh-ui-refresh-item]') : []
     },
     reloadCount: () => state.reloadCount,
+    fetchCalls: () => fetchState.calls.slice(),
+    setFetchMode(mode) {
+      fetchState.mode = mode
+    },
+    /** 模拟"这台宿主压根没有 fetch"（老宿主 / 非浏览器环境）。 */
+    dropFetch() {
+      delete sandbox.fetch
+      delete win.fetch
+    },
     cachesCleared: () => state.cachesCleared,
     swUnregistered: () => state.swUnregistered,
     activeCount: () => observers.filter((observer) => observer.active).length,
@@ -645,11 +694,13 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   eq(panel && panel.style.top, '42px', 'B: 面板在按钮下方（按钮底 38 + 间距 4）')
 
   const items = a.panelItems()
-  eq(items.length, 2, 'B: 两个菜单项')
+  eq(items.length, 3, 'B: 三个菜单项')
   eq(items[0] && items[0].getAttribute('data-dsh-ui-refresh-item'), 'reload', 'B: 第一项 id=reload')
   eq(items[1] && items[1].getAttribute('data-dsh-ui-refresh-item'), 'hard', 'B: 第二项 id=hard')
+  eq(items[2] && items[2].getAttribute('data-dsh-ui-refresh-item'), 'restart', 'B: 第三项 id=restart')
   eq(items[0] && items[0].textContent, '刷新界面', 'B: 第一项文案「刷新界面」')
   eq(items[1] && items[1].textContent, '清空缓存并刷新', 'B: 第二项文案「清空缓存并刷新」')
+  eq(items[2] && items[2].textContent, '重启应用', 'B: 第三项文案「重启应用」')
   eq(items[0] && items[0].getAttribute('role'), 'menuitem', 'B: 菜单项 role=menuitem')
   eq(a.document.activeElement, items[0], 'B: 打开时焦点落在第一项')
   eq(a.window.countListeners('resize'), 1, 'B: 面板打开时跟随 resize')
@@ -689,12 +740,15 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
 
   guard('B open6', () => btn.dispatch('click', {}))
   const arrowItems = a.panelItems()
+  eq(arrowItems.length, 3, 'B: 方向键测试时三个菜单项都在')
   guard('B down', () => a.document.fire('keydown', { key: 'ArrowDown' }))
   eq(a.document.activeElement, arrowItems[1], 'B: ↓ 移到第二项')
   guard('B down', () => a.document.fire('keydown', { key: 'ArrowDown' }))
-  eq(a.document.activeElement, arrowItems[0], 'B: ↓ 到底回到第一项')
+  eq(a.document.activeElement, arrowItems[2], 'B: ↓ 移到第三项')
+  guard('B down', () => a.document.fire('keydown', { key: 'ArrowDown' }))
+  eq(a.document.activeElement, arrowItems[0], 'B: ↓ 到底回绕到第一项')
   guard('B up', () => a.document.fire('keydown', { key: 'ArrowUp' }))
-  eq(a.document.activeElement, arrowItems[1], 'B: ↑ 回到上一项')
+  eq(a.document.activeElement, arrowItems[2], 'B: ↑ 从第一项回绕到最末一项')
   guard('B tab', () => a.document.fire('keydown', { key: 'Tab' }))
   ok(!a.panel(), 'B: Tab 收起面板')
 
@@ -709,6 +763,66 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   guard('B close', () => btn.dispatch('click', {}))
   eq(a.reloadCount(), 2, 'B: 全程只有那两次刷新')
   eq(a.errors.length, 0, 'B: 过程中没有内部错误', a.errors.join(' | '))
+
+  // ── B2 「重启应用」：点一下只进确认，点第二下才发请求 ────────────────────
+  guard('B open8', () => btn.dispatch('click', {}))
+  const restartItem = a.panelItems()[2]
+  ok(!!restartItem, 'B2: 面板里有第三项（重启应用）')
+  guard('B restart arm', () => restartItem.dispatch('click', {}))
+  eq(a.fetchCalls().length, 0, 'B2: 第一下只进确认状态，不发重启请求')
+  eq(restartItem.textContent, '再次点击确认重启', 'B2: 第一下把文案换成二次确认')
+  ok(!!a.panel(), 'B2: 确认状态下面板不关（keepOpen）')
+
+  guard('B restart go', () => restartItem.dispatch('click', {}))
+  eq(a.fetchCalls().length, 1, 'B2: 第二下才发出一次重启请求')
+  const restartCall = a.fetchCalls()[0] || {}
+  eq(restartCall.url, '/dsh-ui-refresh/api/v1/restart', 'B2: 请求打到插件自己的重启路由')
+  eq(restartCall.options && restartCall.options.method, 'POST', 'B2: 用 POST')
+  eq(restartCall.options && restartCall.options.credentials, 'same-origin', 'B2: 带 same-origin 凭据')
+  eq(restartCall.options && restartCall.options.body, '{}', 'B2: 请求体是空对象')
+  await a.flushMicro()
+  eq(restartItem.textContent, '正在重启…', 'B2: 宿主回 200 后显示「正在重启…」')
+  a.tick(4200)
+  eq(restartItem.textContent, '重启应用', 'B2: 提示停留几秒后自己复原成「重启应用」')
+
+  // 二次确认 3 秒后自己失效
+  guard('B restart rearm', () => restartItem.dispatch('click', {}))
+  eq(restartItem.textContent, '再次点击确认重启', 'B2: 又进入确认状态')
+  a.tick(3100)
+  eq(restartItem.textContent, '重启应用', 'B2: 3 秒不点，确认状态过期复原')
+  eq(a.fetchCalls().length, 1, 'B2: 过期不算确认，没有多打请求')
+
+  // 关面板要撤销确认状态
+  guard('B restart arm2', () => restartItem.dispatch('click', {}))
+  guard('B restart esc', () => a.document.fire('keydown', { key: 'Escape' }))
+  ok(!a.panel(), 'B2: Escape 收面板')
+  guard('B open9', () => btn.dispatch('click', {}))
+  eq(a.panelItems()[2] && a.panelItems()[2].textContent, '重启应用', 'B2: 关面板会把确认状态清掉')
+
+  // 宿主拒绝 / 网络失败时的提示
+  a.setFetchMode('405')
+  guard('B restart 405 arm', () => a.panelItems()[2].dispatch('click', {}))
+  guard('B restart 405 go', () => a.panelItems()[2].dispatch('click', {}))
+  await a.flushMicro()
+  eq(a.panelItems()[2] && a.panelItems()[2].textContent, '只接受 POST', 'B2: 宿主拒绝时显示它给的原因')
+  a.setFetchMode('reject')
+  guard('B restart err arm', () => a.panelItems()[2].dispatch('click', {}))
+  guard('B restart err go', () => a.panelItems()[2].dispatch('click', {}))
+  await a.flushMicro()
+  eq(a.panelItems()[2] && a.panelItems()[2].textContent, '重启请求没发出去', 'B2: 网络失败时的提示')
+  a.setFetchMode('throw')
+  guard('B restart throw arm', () => a.panelItems()[2].dispatch('click', {}))
+  guard('B restart throw go', () => a.panelItems()[2].dispatch('click', {}))
+  await a.flushMicro()
+  eq(a.panelItems()[2] && a.panelItems()[2].textContent, '重启请求没发出去', 'B2: fetch 同步抛异常也不炸')
+  a.setFetchMode('ok')
+  guard('B restart ok arm', () => a.panelItems()[2].dispatch('click', {}))
+  guard('B restart ok go', () => a.panelItems()[2].dispatch('click', {}))
+  await a.flushMicro()
+  eq(a.panelItems()[2] && a.panelItems()[2].textContent, '正在重启…', 'B2: 复位后再点仍然正常')
+  guard('B2 close', () => a.document.fire('keydown', { key: 'Escape' }))
+  ok(!a.panel(), 'B2: 收尾把面板收掉（D 段要从关闭状态开始）')
+  eq(a.errors.length, 0, 'B2: 重启流程里没有内部错误', a.errors.join(' | '))
 
   // ── C 兜底胶囊 ─────────────────────────────────────────────────────────
   section('C 找不到标题栏时的兜底胶囊')
@@ -955,8 +1069,460 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   ok(!/[一-龥]/.test(patch), 'F: patch 里没有中文')
 
   const host = readFileSync(join(here, '..', 'lib', 'index.js'), 'utf8')
-  ok(/export const inject = \[\]/.test(host), 'F: 宿主半边 inject 为空数组（有 inject 缺服务会让整个 GUI 起不来）')
-  ok(/export function apply\(\)/.test(host), 'F: 宿主半边 apply 无参数且不抛')
+  ok(/export const inject = \[\]/.test(host), 'F: 宿主半边顶层 inject 为空数组（有 inject 缺服务会让整个 GUI 起不来）')
+  ok(/export function apply\(\s*ctx\s*\)/.test(host), 'F: 宿主半边 apply 接收 ctx')
+  ok(/ctx\.inject\(/.test(host), 'F: 宿主半边只用运行时 ctx.inject 拿 webServer')
+
+  const hostModule = await import(pathToFileURL(join(here, '..', 'lib', 'index.js')).href)
+  ok(typeof hostModule.apply === 'function', 'F: 宿主半边导出 apply 函数')
+  ok(Array.isArray(hostModule.inject) && hostModule.inject.length === 0, 'F: 宿主半边 inject 运行时是空数组')
+  eq(hostModule.name, 'dsh-ui-refresh', 'F: 宿主半边包名')
+  let threw = ''
+  const badContexts = [undefined, null, {}, { inject() { throw new Error('boom') } }, { inject: 42 }]
+  for (const bad of badContexts) {
+    try {
+      hostModule.apply(bad)
+    } catch (err) {
+      threw = threw || String((err && err.message) || err)
+    }
+  }
+  eq(threw, '', 'F: 宿主半边 apply 对任何 ctx 都不抛（抛了会拦掉整个 GUI）')
+}
+
+// ── G 重启计划：路径常量 / 计划构造与校验 / 同源判据 ──────────────────────
+section('G 重启计划：路径 / 计划 / 同源判据')
+{
+  eq(plan.API_PATH, '/dsh-ui-refresh/api/v1/restart', 'G: 重启路由常量')
+  ok(plan.API_PATH.startsWith('/'), 'G: 路由是绝对路径')
+  eq(plan.PLAN_SCHEMA, 1, 'G: 计划 schema = 1')
+  eq(plan.CONFIRM_MS, 3000, 'G: 二次确认窗口 3 秒')
+  eq(plan.EXIT_TIMEOUT_MS, 30000, 'G: 等旧进程退出的上限 30 秒')
+  eq(plan.PROBE_MS, 2500, 'G: 起完新进程观察 2.5 秒')
+
+  // 客户端半边把路径写死在自己的 bundle 里（两个半边各写一份），这里盯着两者一致
+  const clientSrc = readFileSync(join(here, '..', 'lib', 'client.js'), 'utf8')
+  ok(clientSrc.indexOf(`'${plan.API_PATH}'`) >= 0, 'G: 客户端里写死的路径与 API_PATH 一致')
+
+  ok(plan.isLoopbackAuthority('127.0.0.1'), 'G: 127.0.0.1 是回环')
+  ok(plan.isLoopbackAuthority('localhost'), 'G: localhost 是回环')
+  ok(plan.isLoopbackAuthority('[::1]'), 'G: [::1] 是回环')
+  ok(plan.isLoopbackAuthority('LOCALHOST:19387'), 'G: 大写 + 端口也认')
+  ok(plan.isLoopbackAuthority('[::1]:19387'), 'G: IPv6 + 端口也认')
+  ok(!plan.isLoopbackAuthority('localhost.evil.com'), 'G: localhost.evil.com 不是回环')
+  ok(!plan.isLoopbackAuthority('192.168.1.9:19387'), 'G: 局域网地址不是回环')
+  ok(!plan.isLoopbackAuthority(''), 'G: 空 Host 不是回环')
+  ok(!plan.isLoopbackAuthority(undefined), 'G: 没有 Host 不是回环')
+
+  ok(plan.isSameOriginRequest({}), 'G: 一个头都没有也放行（桌面外壳代理会剥掉 Host/Origin）')
+  ok(plan.isSameOriginRequest({ host: '127.0.0.1:19387' }), 'G: 只有回环 Host 放行')
+  ok(plan.isSameOriginRequest({ host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' }), 'G: Host 与 Origin 同源放行')
+  ok(!plan.isSameOriginRequest({ host: 'evil.com' }), 'G: 非回环 Host 拒绝')
+  ok(!plan.isSameOriginRequest({ host: '127.0.0.1:19387', origin: 'http://evil.com' }), 'G: Origin 与 Host 不同源拒绝')
+  ok(!plan.isSameOriginRequest({ host: '127.0.0.1:19387', origin: 'null' }), 'G: Origin: null 拒绝')
+  ok(!plan.isSameOriginRequest({ 'sec-fetch-site': 'cross-site' }), 'G: 跨站声明直接拒绝')
+  ok(plan.isSameOriginRequest({ host: 'localhost:19387', 'sec-fetch-site': 'same-origin' }), 'G: 同站声明放行')
+
+  ok(plan.isDesktopHost({ electron: '38.0.0' }), 'G: versions.electron 有值即桌面端')
+  ok(!plan.isDesktopHost({ node: '22.0.0' }), 'G: 纯 node 宿主不算桌面端')
+  ok(!plan.isDesktopHost(undefined), 'G: versions 缺失也不算')
+
+  const made = plan.buildPlan({
+    pid: 4242,
+    argv: ['C:\\App\\app.exe', '--expose-internals', 'host.js', 'profile'],
+    execPath: 'C:\\App\\app.exe',
+    cwd: 'C:\\App',
+    planPath: 'C:\\home\\.dsh\\ui-refresh\\restart-plan.json',
+    logPath: 'C:\\home\\.dsh\\ui-refresh\\restart.log',
+    electron: true,
+    now: new Date('2026-10-03T00:00:00.000Z'),
+  })
+  eq(made.schema, 1, 'G: 计划带 schema')
+  eq(made.pid, 4242, 'G: 计划记住旧 pid')
+  eq(made.args.length, 3, 'G: argv[0] 与 execPath 相同时会被切掉')
+  eq(made.args[0], '--expose-internals', 'G: 剩下的参数原样保留')
+  eq(made.createdAt, '2026-10-03T00:00:00.000Z', 'G: 时间戳可注入（测试要能假装时间）')
+  eq(made.fallback && made.fallback.cwd, 'C:\\App', 'G: Electron 桌面的兜底 = exe 自己所在目录')
+  eq(made.fallback && made.fallback.args.length, 0, 'G: 兜底不带任何参数（等同双击图标）')
+  const webPlan = plan.buildPlan({
+    pid: 1,
+    argv: ['node', 'x.js'],
+    execPath: '/usr/bin/node',
+    cwd: '/tmp',
+    planPath: 'p',
+    logPath: 'l',
+    electron: false,
+  })
+  eq(webPlan.fallback, null, 'G: 非 Electron / 非 exe 宿主不给兜底命令')
+  eq(plan.validatePlan(made).ok, true, 'G: 自家造的计划能过校验')
+  eq(plan.validatePlan(made).plan, made, 'G: 校验通过时把计划原样返回')
+
+  const badPlans = [
+    [null, '不是对象'],
+    [[], '是数组'],
+    [{ ...made, schema: 2 }, 'schema 版本不对'],
+    [{ ...made, pid: 0 }, 'pid 为 0'],
+    [{ ...made, pid: 1.5 }, 'pid 不是整数'],
+    [{ ...made, execPath: 'relative.exe' }, 'execPath 不是绝对路径'],
+    [{ ...made, args: ['ok', 42] }, 'args 里有非字符串'],
+    [{ ...made, cwd: '' }, 'cwd 为空'],
+    [{ ...made, fallback: { execPath: 1 } }, 'fallback 不合法'],
+  ]
+  for (const [value, why] of badPlans) {
+    const verdict = plan.validatePlan(value)
+    ok(
+      verdict.ok === false && typeof verdict.reason === 'string' && verdict.reason.length > 0,
+      `G: 拒绝不合法的计划 —— ${why}`,
+    )
+  }
+  eq(plan.validatePlan({ ...made, fallback: null }).ok, true, 'G: fallback 允许是 null')
+  eq(plan.validatePlan({ ...made, fallback: undefined }).ok, true, 'G: fallback 允许缺省')
+
+  const summary = plan.planSummary(made)
+  ok(summary.indexOf('pid=4242') >= 0 && summary.indexOf('args=3') >= 0, 'G: 摘要里带 pid 与参数个数')
+  ok(/fallback=yes/.test(summary), 'G: 摘要标出有兜底命令')
+  ok(/fallback=no/.test(plan.planSummary(webPlan)), 'G: 没有兜底时标 no')
+  const line = plan.logLine('helper', 'hi', new Date('2026-10-03T00:00:00.000Z'))
+  eq(line, '2026-10-03T00:00:00.000Z [helper] hi\n', 'G: 日志行 = ISO 时间 + 级别 + 内容')
+}
+
+// ── H 宿主半边：重启路由（状态码 / 计划 / 助手启动 / 退出时机）────────────
+section('H 宿主半边：重启路由')
+{
+  const hostModule = await import(pathToFileURL(join(here, '..', 'lib', 'index.js')).href)
+  const planDir = join('C:\\home', '.dsh', 'ui-refresh')
+  const expectedPlanPath = join(planDir, 'restart-plan.json')
+
+  function makeHost(overrides) {
+    const state = { registered: [], effects: [], plans: [], logs: [], spawns: [], exited: [], later: [] }
+    const webServer = {
+      register(route) {
+        state.registered.push(route)
+        return () => {
+          state.removed = (state.removed ?? 0) + 1
+        }
+      },
+    }
+    const ctx = {
+      webServer,
+      effect(fn, label) {
+        state.effects.push(label)
+        return fn()
+      },
+    }
+    state.disposer = hostModule.registerRestartRoute(ctx, {
+      spawnFn(execPath, args, options) {
+        const child = {
+          pid: 7000 + state.spawns.length,
+          unrefCalled: false,
+          unref() {
+            this.unrefCalled = true
+            return this
+          },
+        }
+        state.spawns.push({ execPath, args, options, child })
+        return child
+      },
+      mkdir() {},
+      writeFile(file, text) {
+        state.plans.push({ file, text })
+      },
+      appendFile(file, text) {
+        state.logs.push(text)
+      },
+      versions: { electron: '38.0.0' },
+      argv: ['C:\\App\\app.exe', '--expose-internals', 'host.js'],
+      execPath: 'C:\\App\\app.exe',
+      cwd: 'C:\\App',
+      env: { DSH_HOME: 'C:\\home', ELECTRON_RUN_AS_NODE: '1' },
+      home: 'C:\\home',
+      pid: 4242,
+      later(fn) {
+        state.later.push(fn)
+        return state.later.length
+      },
+      exit(code) {
+        state.exited.push(code)
+      },
+      now: () => new Date('2026-10-03T00:00:00.000Z'),
+      ...(overrides ?? {}),
+    })
+    state.route = state.registered[0]
+    return state
+  }
+
+  function makeReq(method, headers) {
+    return { method, headers: headers ?? {} }
+  }
+  function makeRes() {
+    const res = { status: null, headers: null, body: '', finished: [] }
+    res.writeHead = (status, headers) => {
+      res.status = status
+      res.headers = headers
+    }
+    res.end = (text) => {
+      res.body = text
+    }
+    res.on = (type, fn) => {
+      if (type === 'finish') res.finished.push(fn)
+    }
+    res.finish = () => {
+      for (const fn of res.finished) fn()
+    }
+    return res
+  }
+
+  const h = makeHost()
+  eq(h.effects.length, 1, 'H: 用 effect 注册路由（宿主 dispose 时自动摘掉）')
+  eq(h.route && h.route.kind, 'exact', 'H: 路由是 exact')
+  eq(h.route && h.route.path, plan.API_PATH, 'H: 路由路径与客户端写死的那条一致')
+  eq(typeof (h.route && h.route.handler), 'function', 'H: 路由带 handler')
+
+  const res405 = makeRes()
+  h.route.handler(makeReq('GET', { host: '127.0.0.1:19387' }), res405)
+  eq(res405.status, 405, 'H: 非 POST 回 405')
+  eq(res405.headers && res405.headers.allow, 'POST', 'H: 405 带 Allow: POST')
+  eq(h.spawns.length, 0, 'H: 非 POST 不会拉起助手')
+
+  const res403 = makeRes()
+  h.route.handler(makeReq('POST', { host: 'evil.com' }), res403)
+  eq(res403.status, 403, 'H: 非回环 Host 回 403')
+  eq(h.spawns.length, 0, 'H: 403 不会拉起助手')
+
+  const h501 = makeHost({ versions: { node: '22.0.0' } })
+  const res501 = makeRes()
+  h501.route.handler(makeReq('POST', { host: '127.0.0.1:19387' }), res501)
+  eq(res501.status, 501, 'H: 纯 node 宿主回 501（web 端有市场自带的重启）')
+  eq(h501.spawns.length, 0, 'H: 501 不会拉起助手')
+
+  const okHost = makeHost()
+  const res200 = makeRes()
+  okHost.route.handler(makeReq('POST', { host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' }), res200)
+  eq(res200.status, 200, 'H: 正常请求回 200')
+  const payload = JSON.parse(res200.body)
+  eq(payload.ok, true, 'H: 回 { ok: true }')
+  eq(payload.helperPid, 7000, 'H: 回助手 pid（便于用户去任务管理器看）')
+  eq(payload.fallback, true, 'H: 告诉客户端有没有兜底命令')
+  eq(res200.headers && res200.headers['cache-control'], 'no-store', 'H: 不许缓存这个响应')
+  eq(okHost.spawns.length, 1, 'H: 只拉起一个助手')
+  const spawnCall = okHost.spawns[0]
+  eq(spawnCall.execPath, 'C:\\App\\app.exe', 'H: 用同一个可执行文件起助手')
+  eq(spawnCall.args[0], hostModule.HELPER_PATH, 'H: 第一个参数是助手的绝对路径')
+  eq(spawnCall.args[1], expectedPlanPath, 'H: 第二个参数是计划文件')
+  eq(spawnCall.options.detached, true, 'H: 助手要 detached（否则会跟着我一起死）')
+  eq(spawnCall.options.stdio, 'ignore', 'H: 助手不要管道（我一退管道就断）')
+  eq(spawnCall.options.cwd, planDir, 'H: 助手在计划目录里跑')
+  eq(spawnCall.options.env.ELECTRON_RUN_AS_NODE, '1', 'H: 助手用 Electron 二进制当 node 跑')
+  eq(spawnCall.options.env.DSH_HOME, 'C:\\home', 'H: 环境原样继承（助手要落在同一个 profile）')
+  eq(spawnCall.child.unrefCalled, true, 'H: 助手被 unref（不拖住我退出）')
+  eq(okHost.plans.length, 1, 'H: 写了一张计划')
+  const written = JSON.parse(okHost.plans[0].text)
+  eq(written.pid, 4242, 'H: 计划里记的是宿主自己的 pid')
+  eq(written.execPath, 'C:\\App\\app.exe', 'H: 计划记下可执行文件')
+  eq(written.args.length, 2, 'H: 计划记下原样参数')
+  eq(written.fallback !== null, true, 'H: 计划带兜底命令')
+  ok(okHost.logs.join('').indexOf('收到重启请求') >= 0, 'H: 写了一条"收到请求"日志')
+
+  const res409 = makeRes()
+  okHost.route.handler(makeReq('POST', { host: '127.0.0.1:19387' }), res409)
+  eq(res409.status, 409, 'H: 已经在重启时回 409')
+  eq(okHost.spawns.length, 1, 'H: 409 不会多拉一个助手')
+
+  eq(okHost.exited.length, 0, 'H: 响应还没发完，本进程不退出')
+  res200.finish()
+  eq(okHost.later.length, 1, 'H: 响应发完才排一个延时')
+  eq(okHost.exited.length, 0, 'H: 延时到点之前不退出')
+  okHost.later[0]()
+  eq(okHost.exited[0], 0, 'H: 退出码 0')
+
+  const plainHost = makeHost()
+  plainHost.route.handler(makeReq('POST', {}), { writeHead() {}, end() {} })
+  eq(plainHost.later.length, 1, 'H: 响应对象没有 finish 事件时也排延时')
+  plainHost.later[0]()
+  eq(plainHost.exited[0], 0, 'H: 照样退出码 0')
+
+  const boomHost = makeHost({
+    spawnFn() {
+      throw new Error('spawn 挂了')
+    },
+  })
+  const res500 = makeRes()
+  boomHost.route.handler(makeReq('POST', { host: '127.0.0.1:19387' }), res500)
+  eq(res500.status, 500, 'H: 起助手失败回 500')
+  ok(JSON.parse(res500.body).error.indexOf('spawn 挂了') >= 0, 'H: 500 里带上原因')
+  eq(boomHost.exited.length, 0, 'H: 失败时绝不退出进程（否则用户连界面都没了）')
+
+  eq(hostModule.registerRestartRoute({}), null, 'H: 没有 webServer 就什么也不注册')
+  eq(hostModule.registerRestartRoute(undefined), null, 'H: 没有 ctx 也不抛')
+  eq(typeof h.disposer, 'function', 'H: register 返回 disposer')
+  h.disposer()
+  eq(h.removed, 1, 'H: disposer 能摘掉路由')
+}
+
+// ── I 分离助手：等旧的死 / 原样重放 / 兜底 ────────────────────────────────
+section('I 分离助手：等旧的死 / 原样重放 / 兜底')
+{
+  const planPath = join('C:\\home', '.dsh', 'ui-refresh', 'restart-plan.json')
+  function makePlanFile(overrides) {
+    return JSON.stringify({
+      schema: plan.PLAN_SCHEMA,
+      createdAt: '2026-10-03T00:00:00.000Z',
+      requestedBy: 'dsh-ui-refresh',
+      pid: 4242,
+      execPath: 'C:\\App\\app.exe',
+      args: ['--expose-internals', 'host.js'],
+      cwd: 'C:\\App',
+      fallback: { execPath: 'C:\\App\\app.exe', args: [], cwd: 'C:\\App' },
+      planPath,
+      logPath: join('C:\\home', '.dsh', 'ui-refresh', 'restart.log'),
+      ...(overrides ?? {}),
+    })
+  }
+
+  function runCase(mode) {
+    const options = mode ?? {}
+    const calls = { launches: [], log: [], sleeps: [], waits: [] }
+    const result = helper.runHelper(planPath, {
+      readFile() {
+        if (options.readError) throw new Error(options.readError)
+        if (options.raw !== undefined) return options.raw
+        return makePlanFile(options.plan)
+      },
+      append: (file, text) => calls.log.push(text),
+      now: () => new Date('2026-10-03T00:00:00.000Z'),
+      wait(pid, opts) {
+        calls.waits.push({ pid, options: opts })
+        return options.waitResult ?? { exited: true, waitedMs: 120 }
+      },
+      sleep: (ms) => calls.sleeps.push(ms),
+      launch(target, opts) {
+        const index = calls.launches.length
+        calls.launches.push({ target, options: opts })
+        const dead = Array.isArray(options.dead) && options.dead.includes(index)
+        return { pid: 8000 + index, exitCode: dead ? 1 : null, signalCode: null }
+      },
+      env: { DSH_HOME: 'C:\\home', ELECTRON_RUN_AS_NODE: '1' },
+      probeMs: 2500,
+    })
+    return { result, calls }
+  }
+
+  const okCase = runCase()
+  eq(okCase.result.ok, true, 'I: 正常路径返回 ok')
+  eq(okCase.result.mode, 'replay', 'I: 方式标成原样重放')
+  eq(okCase.result.pid, 8000, 'I: 返回新进程 pid')
+  eq(okCase.calls.waits.length, 1, 'I: 先等旧进程退出')
+  eq(okCase.calls.waits[0].pid, 4242, 'I: 等的是计划里的 pid')
+  eq(okCase.calls.launches.length, 1, 'I: 只起了一个进程')
+  eq(okCase.calls.launches[0].target.execPath, 'C:\\App\\app.exe', 'I: 用计划里的可执行文件')
+  eq(okCase.calls.launches[0].target.args.length, 2, 'I: 参数原样重放')
+  eq(okCase.calls.launches[0].target.cwd, 'C:\\App', 'I: cwd 原样重放')
+  ok(okCase.calls.log.join('').indexOf('pid=4242') >= 0, 'I: 日志里记下等了谁')
+  ok(okCase.calls.log.join('').indexOf('原样重放') >= 0, 'I: 日志里记下重放方式')
+
+  const stuck = runCase({ waitResult: { exited: false, waitedMs: 30000 } })
+  eq(stuck.result.ok, true, 'I: 旧进程超时没死也照样起新的')
+  ok(stuck.calls.log.join('').indexOf('仍然按计划启动') >= 0, 'I: 超时会写一条警告日志')
+
+  const fell = runCase({ dead: [0] })
+  eq(fell.result.ok, true, 'I: 回退到兜底后算成功')
+  eq(fell.result.mode, 'fallback', 'I: 方式标成 fallback')
+  eq(fell.calls.launches.length, 2, 'I: 一共起了两次')
+  eq(fell.calls.launches[1].target.execPath, 'C:\\App\\app.exe', 'I: 兜底用同一个 exe')
+  eq(fell.calls.launches[1].target.args.length, 0, 'I: 兜底不带参数（等同双击图标）')
+  eq(fell.calls.launches[1].target.cwd, 'C:\\App', 'I: 兜底用 exe 自己的目录')
+  ok(fell.calls.sleeps.length >= 2, 'I: 每次起完都观察一会儿')
+
+  const both = runCase({ dead: [0, 1] })
+  eq(both.result.ok, false, 'I: 兜底也起不来就报失败')
+  ok(String(both.result.reason).indexOf('兜底') >= 0, 'I: 说清是兜底也失败')
+  ok(both.calls.log.join('').indexOf('请手动双击桌面图标') >= 0, 'I: 日志里给出人工出路')
+
+  const noFallback = runCase({ dead: [0], plan: { fallback: null } })
+  eq(noFallback.result.ok, false, 'I: 没有兜底命令就报失败')
+  eq(noFallback.calls.launches.length, 1, 'I: 不会硬起第二次')
+
+  const noFile = runCase({ readError: 'ENOENT' })
+  eq(noFile.result.ok, false, 'I: 读不到计划报失败')
+  ok(String(noFile.result.reason).indexOf('读不到计划文件') >= 0, 'I: 说清是读文件失败')
+  const badJson = runCase({ raw: '{不是 JSON' })
+  eq(badJson.result.ok, false, 'I: 计划不是 JSON 报失败')
+  const badPlan = runCase({ plan: { schema: 99 } })
+  eq(badPlan.result.ok, false, 'I: 计划 schema 不对报失败')
+  eq(badPlan.calls.launches.length, 0, 'I: 校验不过绝不起进程')
+
+  const launched = []
+  const child = helper.launchProcess(
+    { execPath: 'C:\\App\\app.exe', args: ['a'], cwd: 'C:\\App', label: '测试' },
+    {
+      spawnFn(execPath, args, options) {
+        launched.push({ execPath, args, options })
+        return { pid: 999, unref() {} }
+      },
+      env: { ELECTRON_RUN_AS_NODE: '1', DSH_HOME: 'C:\\home' },
+      log: () => {},
+    },
+  )
+  eq(launched.length, 1, 'I: launchProcess 调了 spawn')
+  eq(launched[0].options.env.ELECTRON_RUN_AS_NODE, undefined, 'I: 必须删掉 ELECTRON_RUN_AS_NODE（否则重开的是没窗口的 node）')
+  eq(launched[0].options.env.DSH_HOME, 'C:\\home', 'I: 其余环境原样保留')
+  eq(launched[0].options.detached, true, 'I: 新进程 detached')
+  eq(child.pid, 999, 'I: launchProcess 返回子进程')
+
+  eq(helper.isAlive(4242, () => {}), true, 'I: kill(pid,0) 不抛就是活着')
+  eq(
+    helper.isAlive(4242, () => {
+      const err = new Error('gone')
+      err.code = 'ESRCH'
+      throw err
+    }),
+    false,
+    'I: ESRCH 说明进程没了',
+  )
+  eq(
+    helper.isAlive(4242, () => {
+      const err = new Error('nope')
+      err.code = 'EPERM'
+      throw err
+    }),
+    true,
+    'I: EPERM 也算活着（只是不归我管）',
+  )
+  eq(helper.isAlive(0), false, 'I: 非法 pid 直接算没了')
+  eq(helper.isAlive(undefined), false, 'I: 缺 pid 也算没了')
+
+  let aliveTimes = 3
+  const waited = helper.waitForExit(4242, {
+    intervalMs: 100,
+    kill: () => {
+      if (aliveTimes-- <= 0) {
+        const err = new Error('gone')
+        err.code = 'ESRCH'
+        throw err
+      }
+    },
+    now: (() => {
+      let t = 0
+      return () => (t += 100)
+    })(),
+    sleep: () => {},
+  })
+  eq(waited.exited, true, 'I: 轮询到进程消失')
+  const timedOut = helper.waitForExit(4242, {
+    timeoutMs: 500,
+    intervalMs: 100,
+    kill: () => {},
+    now: (() => {
+      let t = 0
+      return () => (t += 100)
+    })(),
+    sleep: () => {},
+  })
+  eq(timedOut.exited, false, 'I: 超过上限就不等了')
+
+  eq(helper.diedImmediately({ exitCode: 0, signalCode: null }), true, 'I: 已退出算"起来就死"')
+  eq(helper.diedImmediately({ exitCode: null, signalCode: 'SIGKILL' }), true, 'I: 被信号打死也算')
+  eq(helper.diedImmediately({ exitCode: null, signalCode: null }), false, 'I: 还活着就不算')
+  eq(helper.diedImmediately(null), true, 'I: 压根没起来也算')
 }
 
 // ── 汇总 ──────────────────────────────────────────────────────────────────

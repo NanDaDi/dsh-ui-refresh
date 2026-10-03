@@ -24,8 +24,8 @@
 | --- | --- |
 | 插件刚被**热挂载成功**（市场里启用插件、切主题） | **够** —— 条目集变化会实时进图 |
 | 插件只改了**客户端 UI 文件**、且宿主已经提供新 rev | **够**（见下面的"边界"） |
-| 插件**本体的代码更新**（宿主半边或客户端产物） | **不够**，必须完全退出应用重开 |
-| 新增/卸载插件、改 bundles 顺序后要求重启 | **不够**，条目表由宿主启动时决定 |
+| 插件**本体的代码更新**（宿主半边或客户端产物） | **不够** —— 用菜单里的「重启应用」一键重启（或手动退出应用重开） |
+| 新增/卸载插件、改 bundles 顺序后要求重启 | **不够** —— 同上，条目表由宿主启动时决定 |
 
 原因在 `@deepseek-ai/dsh-client-modules`：客户端产物按 `?rev=<mtime/size>` 标记成 `public, max-age=31536000, immutable`（`lib/index.js:159`），脚本正文首次 GET 之后就被缓存住；只有**条目集**变化才会实时反映到模块图上。所以"重新加载一次页面"能覆盖的就是这些 —— 但应用里没有按钮。
 
@@ -34,11 +34,26 @@
 **标题栏路线（默认）**
 
 - 标题栏上的「刷新」按钮出现在「应用」「编辑」右边，样式跟着原生按钮走（同样的高度、圆角、悬停底色）。
-- 点它 → 下拉两项：
+- 点它 → 下拉三项：
   - **刷新界面** = 重新加载当前窗口（等于普通浏览器里按 F5）。
   - **清空缓存并刷新** = 先删掉 Cache Storage 里所有缓存、注销 Service Worker，再重新加载。界面看着像旧的时候用它。
-- 收起方式：点面板外面、点「应用」或「编辑」、按 `Escape` 或 `Tab`。上下方向键在两项之间走焦点，回车执行。
+  - **重启应用** = 关掉当前应用、再自己开回来（下面单独说）。它要点**两下**：第一下变成「再次点击确认重启」，3 秒内再点一下才真的动手 —— 免得手滑把窗口关掉。
+- 收起方式：点面板外面、点「应用」或「编辑」、按 `Escape` 或 `Tab`。上下方向键在三项之间走焦点，回车执行。
 - 面板跟着按钮走：贴着按钮左下角弹出，出屏幕就自动右移或翻到按钮上方。
+
+**「重启应用」怎么做的**
+
+确认之后客户端只做一件事：往插件自己注册的本地路由发一个 `POST /dsh-ui-refresh/api/v1/restart`。真正的动作在宿主半边（跑在 Electron 主进程里）：
+
+1. 把当前进程的**命令行、工作目录、可执行文件路径**写成一份计划文件（`~/.dsh/ui-refresh/restart-plan.json`，**不写任何环境变量或凭据**）；
+2. 用一个**分离的助手进程**执行这份计划 —— 同一个 Electron 二进制以 `ELECTRON_RUN_AS_NODE=1` 当 node 跑 `lib/restart-helper.js`，所以它不随应用一起死；
+3. 宿主进程 250ms 后 `process.exit(0)`：这就是"完全退出"（含托盘）；
+4. 助手轮询**旧 PID 真的消失**（有单实例锁，新进程先起会自己 `quit()`），再用同一套参数把应用起回来；
+5. 起来后睡 2.5 秒探一眼：新进程如果立刻死了（参数被改坏之类），就用**无参数、工作目录 = exe 所在目录**的兜底方式再起一次 —— 这恰好等同于双击桌面上的「DeepSeek Harness」图标。
+
+所以最坏情况也不会把应用弄丢：桌面图标 / 开始菜单随时能手动开回来。整个过程写进 `~/.dsh/ui-refresh/restart.log`，起不来的时候先看它。
+
+在浏览器里跑的 `dsh web`（不是 Electron 宿主）没有这条路：路由直接回 **501**，菜单里会显示宿主给的原因 —— 那种环境自带市场的一键重启。
 
 **兜底路线（找不到标题栏时自动启用）**
 
@@ -63,7 +78,8 @@ github:NanDaDi/dsh-ui-refresh
 
 ## 实现与边界
 
-- **纯客户端 + 纯 DOM**：宿主半边（`lib/index.js`）是空的，什么都不做。浏览器半边往外壳 preload 挂的 `[data-windows-menu]`（一个 open shadow root）里的 `[role="menubar"]` 追加一颗 `button`，下拉面板是自己画的固定定位 div。不注册 slot 座位、不引 React、不碰宿主模块、不写文件。
+- **界面全在客户端 + 纯 DOM**：浏览器半边往外壳 preload 挂的 `[data-windows-menu]`（一个 open shadow root）里的 `[role="menubar"]` 追加一颗 `button`，下拉面板是自己画的固定定位 div —— 这部分不注册 slot 座位、不引 React、不碰宿主模块。宿主半边（`lib/index.js`）只做一件事：往 `webServer` 注册一条 `POST` 路由给「重启应用」用（`ctx.inject(['webServer'], …)` 是**运行时**注入，所以没有 webServer 的宿主也不会把启动拖垮）。
+- **重启只对桌面外壳开放**：路由先查同源（只认 loopback 的 Host / Origin，`sec-fetch-site: cross-site` 直接拒），再查 `process.versions.electron`，不是 Electron 宿主就回 501。计划、助手代码、日志都只落在 `~/.dsh/ui-refresh/` 下，不碰 `app.asar`、不改别的插件。
 - **声明一条纯 insert 的组合补丁**（`cordis.patch.yml`，三行）：只把本插件插进组合树，不动任何别人的条目。内核与市场的**安装入口**都要求包声明 `dsh.bundle` —— 只声明 `dsh.client` 的包会被直接拒掉（`not-bundle`，界面文案是「这个包没有声明组合包，不能作为插件管理」），所以这一行不是装饰。
 - **样式分两处注入**：按钮的样式必须注入**它所在的那个 shadow root**（在外面写的选择器穿不进去），面板和胶囊的样式注入 `document.head`。都只用 DSH 自己的令牌（`--dsw-alias-*`，逐级回退），所以亮色/暗色都协调。
 - **不动官方文件**：左上角的「应用」「编辑」是 Electron 原生菜单（每次开窗按模板重建），插件没有接口往里加项 —— 所以这里是在它**旁边**加一颗自己的按钮，官方菜单一个字没改；`app.asar` 也没动过。
@@ -71,7 +87,8 @@ github:NanDaDi/dsh-ui-refresh
 - **不抛异常是第一原则**：客户端条目一旦抛异常或停在 pending，加载器会拦掉整个 GUI（`web boot: N entry did not activate`）。所以 `inject` 为空、`apply` 全程 try/catch、`document.body` 还没出来时等 `DOMContentLoaded`；找不到 shadow root、没有 `localStorage`、没有 `caches`、没有 `navigator.serviceWorker`、`getBoundingClientRect` 抛异常……每种情况都有对应处理，最差就是退回胶囊或什么都不显示。
 - **重复 `apply` 安全**：`start()` 幂等，`MutationObserver` 只挂一次；`dispose` 时按钮、面板、胶囊、两张样式表、所有 window/ document 监听和观察器全部撤掉。
 - **暂无全局快捷键**：`Ctrl+R` / `Ctrl+Alt+按键` 这类组合属于 DSH 自己的可改键空间，可能和已有绑定撞车，所以只做按钮。
-- 它**不是**重启助手：真要重启还是得完全退出应用（含托盘）再打开。
+- **三个坑（都在设计里绕开了）**：① 启动参数必须**原样重放** —— 宿主就是 Electron 本体，argv 里带着 `--expose-internals`、asar 路径、profile、runtime 目录，凭记忆拼不出来，所以直接从 `process.argv` 抄；② **单实例锁**要求旧进程先死透，所以用分离助手轮询 PID，而不是立刻起新的；③ **环境继承** —— `DSH_HOME` / `DSH_PROFILE` / cwd 不带过去会落到别的 profile，所以计划文件不存 env，由助手原样继承。
+- **为什么"刷新一下"救不了**：见上面那张表。刷新只换页面，插件本体的代码和条目表都得由宿主重启重读 —— 这也正是这个插件除了刷新还带一颗重启的原因。
 
 ## 开发 / 自检
 
@@ -79,19 +96,19 @@ github:NanDaDi/dsh-ui-refresh
 node test/selftest.mjs
 ```
 
-自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` 替身），覆盖 **147 条断言**：标题栏挂载与样式、下拉开合与每一项的行为、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景，以及包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
+自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` / `fetch` 替身），覆盖 **323 条断言**：标题栏挂载与样式、下拉开合与每一项的行为（含「重启应用」的两段式确认、只发一次 `POST`、提示自己过期、宿主拒绝时显示原因）、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景；另外三节不靠 DOM —— 重启计划的纯函数（路径常量、argv 切分、计划校验、同源判据）、宿主半边的路由（405 / 403 / 501 / 409 / 200、spawn 参数、响应 `finish` 之后才退出）、分离助手（等旧 PID 消失、原样重放、立刻死则兜底、计划坏掉就不起进程）；最后是包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
 
 `npm test` 与上面的命令等价；`npm run check` 会先做 `node --check` 再跑自检。
 
 ### 真浏览器对照测试
 
-`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **64 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」时自己的面板收起而原生菜单照弹）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、以及 3 秒找不到标题栏时退回胶囊。
+`test/manual.html` 会在页面里 1:1 复刻外壳的 `installWindowsMenu()`（`<div data-windows-menu>` + open shadow root + `[role=menubar]` +「应用」「编辑」两颗按钮，连 CSS 一起抄），然后加载 `../lib/client.js`，跑 **84 条断言**：真 shadow root 里的挂载与**样式级联**（跟官方那两颗按钮逐项比 height / font-size / color / background / border-radius / padding / cursor / line-height / `-webkit-app-region`）、真 `PointerEvent` 的 `composedPath` 行为（点自己的按钮能开能关、点「应用」时自己的面板收起而原生菜单照弹）、`Escape` / 方向键 / `Tab`、窗口 resize 后面板跟着按钮走、dispose 收干净、3 秒找不到标题栏时退回胶囊，以及用**假 `fetch`** 记下「重启应用」真正发出的请求（点第一下不动、点第二下恰好一次 `POST /dsh-ui-refresh/api/v1/restart`、`same-origin`、提示过期、宿主拒绝时显示原因）。
 
 用任意 Chromium 打开这个文件即可，结果在页面顶部；命令行版（无头）：
 
 ```powershell
 & "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" --headless=new --disable-gpu `
-  --allow-file-access-from-files --virtual-time-budget=9000 `
+  --allow-file-access-from-files --virtual-time-budget=20000 `
   --dump-dom "file:///<仓库路径>/test/manual.html"
 ```
 
