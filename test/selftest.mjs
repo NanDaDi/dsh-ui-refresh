@@ -920,6 +920,45 @@ section('A 标题栏菜单条：挂载 / 样式 / 幂等')
   eq(e10.ourButtons().length, 1, 'E: 补回后仍然只有一颗')
 }
 
+// ── F 包声明（2026-10-03 实测的坑：没声明 dsh.bundle 的包，内核与市场都拒绝安装）──
+// 依据（本机内核 / 市场源码）：
+//   · @deepseek-ai/dsh-plugin-manager lib/index.js:1785-1786 —— pnpm 装完后
+//     bundleManifest() 读不到 dsh.bundle 就 ManagementFailure('not-bundle') 并把
+//     dependencies 回滚，界面上是「这个包没有声明组合包，不能作为插件管理」；
+//   · dshmarket lib/hot.js:543-555 —— client-only shim 只对**已经躺在 dependencies 里**
+//     的包生效（mountClientOnlyDeps 每次市场启动扫一遍），安装入口不认它；
+//   · dshmarket lib/hot.js:721 —— 热挂载只接受纯 insert 的 patch，含配置行/表达式就得重启。
+{
+  const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'))
+  const dsh = pkg.dsh || {}
+  eq(pkg.name, 'dsh-ui-refresh', 'F: 包名')
+  ok(typeof pkg.version === 'string' && /^[0-9]+\.[0-9]+\.[0-9]+$/.test(pkg.version), 'F: 版本是三段式')
+  ok(!!dsh.client, 'F: 声明 dsh.client（浏览器半边才会被送进页面）')
+  eq(dsh.client ? dsh.client.platform : undefined, 'web', 'F: 平台是 web')
+  eq(dsh.bundle ? dsh.bundle.patch : undefined, './cordis.patch.yml', 'F: 声明 dsh.bundle.patch（缺它被判 not-bundle，安装直接失败）')
+  ok(Array.isArray(pkg.files) && pkg.files.includes('cordis.patch.yml'), 'F: files 里带上 patch 文件（否则装到本机也缺它）')
+  eq(pkg.exports && pkg.exports['./client'] ? pkg.exports['./client'].default : undefined, './lib/client.js', 'F: exports ./client 指向 lib/client.js')
+
+  let patch = ''
+  let patchRead = false
+  try {
+    patch = readFileSync(join(here, '..', 'cordis.patch.yml'), 'utf8')
+    patchRead = true
+  } catch {}
+  ok(patchRead, 'F: cordis.patch.yml 真的存在')
+  const patchLines = patch.split('\n')
+  ok(/^- insert:\s*$/.test(patchLines[0] || ''), 'F: patch 第一条是顶层 insert')
+  ok(/^\s{4}- id: ui-refresh\s*$/.test(patchLines[1] || ''), 'F: insert 条目的 id')
+  ok(/^\s{6}name: 'dsh-ui-refresh'\s*$/.test(patchLines[2] || ''), 'F: insert 条目的 name 是包名')
+  eq(patch.split('\n').filter((line) => line.trim() !== '').length, 3, 'F: 只有三行数据（纯 insert）')
+  ok(!/[={}]/.test(patch.slice(patch.indexOf('insert:'))), 'F: insert 里没有配置行/表达式（纯 insert 才能热挂载）')
+  ok(!/[一-龥]/.test(patch), 'F: patch 里没有中文')
+
+  const host = readFileSync(join(here, '..', 'lib', 'index.js'), 'utf8')
+  ok(/export const inject = \[\]/.test(host), 'F: 宿主半边 inject 为空数组（有 inject 缺服务会让整个 GUI 起不来）')
+  ok(/export function apply\(\)/.test(host), 'F: 宿主半边 apply 无参数且不抛')
+}
+
 // ── 汇总 ──────────────────────────────────────────────────────────────────
 console.log('\n' + '─'.repeat(60))
 if (failures.length) {

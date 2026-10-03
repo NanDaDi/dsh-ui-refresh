@@ -1,0 +1,3 @@
+- insert:
+    - id: ui-refresh
+      name: 'dsh-ui-refresh'

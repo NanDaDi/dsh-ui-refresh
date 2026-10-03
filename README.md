@@ -64,6 +64,7 @@ github:NanDaDi/dsh-ui-refresh
 ## 实现与边界
 
 - **纯客户端 + 纯 DOM**：宿主半边（`lib/index.js`）是空的，什么都不做。浏览器半边往外壳 preload 挂的 `[data-windows-menu]`（一个 open shadow root）里的 `[role="menubar"]` 追加一颗 `button`，下拉面板是自己画的固定定位 div。不注册 slot 座位、不引 React、不碰宿主模块、不写文件。
+- **声明一条纯 insert 的组合补丁**（`cordis.patch.yml`，三行）：只把本插件插进组合树，不动任何别人的条目。内核与市场的**安装入口**都要求包声明 `dsh.bundle` —— 只声明 `dsh.client` 的包会被直接拒掉（`not-bundle`，界面文案是「这个包没有声明组合包，不能作为插件管理」），所以这一行不是装饰。
 - **样式分两处注入**：按钮的样式必须注入**它所在的那个 shadow root**（在外面写的选择器穿不进去），面板和胶囊的样式注入 `document.head`。都只用 DSH 自己的令牌（`--dsw-alias-*`，逐级回退），所以亮色/暗色都协调。
 - **不动官方文件**：左上角的「应用」「编辑」是 Electron 原生菜单（每次开窗按模板重建），插件没有接口往里加项 —— 所以这里是在它**旁边**加一颗自己的按钮，官方菜单一个字没改；`app.asar` 也没动过。
 - **`-webkit-app-region: no-drag`**：按钮和面板都带这条，落在外壳可拖拽区域上时点它不会变成拖窗口。
@@ -78,7 +79,7 @@ github:NanDaDi/dsh-ui-refresh
 node test/selftest.mjs
 ```
 
-自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` 替身），覆盖 **131 条断言**：标题栏挂载与样式、下拉开合与每一项的行为、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、以及各种"输入不合法也不许抛异常"的场景。
+自检用 `node:vm` 跑浏览器半边，配一套最小 DOM 替身（含 open shadow root、事件冒泡到 `document`、假定时器、`caches` / `serviceWorker` 替身），覆盖 **147 条断言**：标题栏挂载与样式、下拉开合与每一项的行为、Escape / 点外 / 点内 / 方向键 / `Tab`、兜底胶囊的 3 秒接管与迟到菜单条回收、拖动与位置持久化、dispose 收干净、各种"输入不合法也不许抛异常"的场景，以及包声明本身（`cordis.patch.yml` 真的在、是纯 insert、`files` 带上它、`exports ./client` 指向浏览器半边 —— 这条是安装被 `not-bundle` 拒掉那次留下的回归防线）。
 
 `npm test` 与上面的命令等价；`npm run check` 会先做 `node --check` 再跑自检。
 
